@@ -268,6 +268,21 @@ target_link_libraries(string_utils_tests fmt::fmt)
 target_include_directories(string_utils_tests PRIVATE ${inc_headers})
 add_kyty_test(string_utils_tests)
 
+# Decoding is pure logic, so this needs no GPU and stays out of the `gpu` label. ShaderDecoder.cpp
+# dispatches to every family, so all six decoder translation units have to come along.
+add_executable(shader_memory_decode_tests EXCLUDE_FROM_ALL
+	../tests/ShaderMemoryDecodeTests.cpp
+	graphics/shader/recompiler/ShaderDecoder.cpp
+	graphics/shader/recompiler/ScalarAluOps.cpp
+	graphics/shader/recompiler/VectorAluOps.cpp
+	graphics/shader/recompiler/MemoryOps.cpp
+	graphics/shader/recompiler/ImageOps.cpp
+	graphics/shader/recompiler/ExportOps.cpp
+)
+target_link_libraries(shader_memory_decode_tests fmt::fmt)
+target_include_directories(shader_memory_decode_tests PRIVATE ${inc_headers})
+add_kyty_test(shader_memory_decode_tests)
+
 add_executable(page_manager_tests EXCLUDE_FROM_ALL
 	../tests/PageManagerTests.cpp
 	graphics/host_gpu/pageManager.cpp
