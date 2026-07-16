@@ -647,7 +647,9 @@ public:
 	void SetThreadDtors(thread_dtors_func_t dtors) { m_thread_dtors = dtors; }
 
 private:
-	// Common::Mutex           m_mutex;
+	// Every setter below runs from KYTY_SUBSYSTEM_INIT(Pthread) on the main thread, before any
+	// guest code exists, and the members are read-only afterwards -- so no lock is needed. The
+	// exception is m_thread_dtors, which the guest sets later, hence the atomic.
 	PthreadMutexattr      m_default_mutexattr      = nullptr;
 	PthreadRwlockattr     m_default_rwlockattr     = nullptr;
 	PthreadCondattr       m_default_condattr       = nullptr;

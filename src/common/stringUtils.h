@@ -7,10 +7,8 @@
 #include <algorithm>
 #include <cctype>
 #include <charconv>
-#include <codecvt>
 #include <filesystem>
 #include <fmt/format.h>
-#include <locale>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -316,10 +314,51 @@ inline std::string SafeCsv(std::string_view text) {
 	return std::string(text);
 }
 
+// Returns an empty string when the input is not well-formed UTF-16 (an unpaired surrogate), which
+// callers already treat as failure. The previous std::wstring_convert implementation threw
+// std::range_error instead; nothing in this codebase catches, and the non-clang-cl builds compile
+// with -fno-exceptions, so malformed input from a guest was a guaranteed process kill.
+// std::wstring_convert is also deprecated in C++17 and removed in C++26.
 inline std::string Utf16ToUtf8(const char16_t* utf16) {
-	std::u16string                                                    input(utf16);
-	std::wstring_convert<std::codecvt_utf8_utf16<char16_t>, char16_t> convert;
-	return convert.to_bytes(input);
+	std::string out;
+	if (utf16 == nullptr) {
+		return out;
+	}
+
+	for (const char16_t* p = utf16; *p != u'\0'; p++) {
+		auto cp = static_cast<char32_t>(*p);
+
+		if (cp >= 0xd800 && cp <= 0xdbff) {
+			// A high surrogate must be followed by a low one. Reading p[1] is safe even at the end
+			// of the string: that is the terminator, which fails the range check below.
+			const auto low = static_cast<char32_t>(p[1]);
+			if (low < 0xdc00 || low > 0xdfff) {
+				return {};
+			}
+			cp = 0x10000 + ((cp - 0xd800) << 10U) + (low - 0xdc00);
+			p++;
+		} else if (cp >= 0xdc00 && cp <= 0xdfff) {
+			return {};
+		}
+
+		if (cp < 0x80) {
+			out += static_cast<char>(cp);
+		} else if (cp < 0x800) {
+			out += static_cast<char>(0xc0 | (cp >> 6U));
+			out += static_cast<char>(0x80 | (cp & 0x3f));
+		} else if (cp < 0x10000) {
+			out += static_cast<char>(0xe0 | (cp >> 12U));
+			out += static_cast<char>(0x80 | ((cp >> 6U) & 0x3f));
+			out += static_cast<char>(0x80 | (cp & 0x3f));
+		} else {
+			out += static_cast<char>(0xf0 | (cp >> 18U));
+			out += static_cast<char>(0x80 | ((cp >> 12U) & 0x3f));
+			out += static_cast<char>(0x80 | ((cp >> 6U) & 0x3f));
+			out += static_cast<char>(0x80 | (cp & 0x3f));
+		}
+	}
+
+	return out;
 }
 
 inline ByteBuffer HexToBin(std::string_view text) {

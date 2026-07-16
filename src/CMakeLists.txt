@@ -261,6 +261,13 @@ add_executable(singleton_tests EXCLUDE_FROM_ALL
 target_include_directories(singleton_tests PRIVATE ${inc_headers})
 add_kyty_test(singleton_tests)
 
+add_executable(string_utils_tests EXCLUDE_FROM_ALL
+	../tests/StringUtilsTests.cpp
+)
+target_link_libraries(string_utils_tests fmt::fmt)
+target_include_directories(string_utils_tests PRIVATE ${inc_headers})
+add_kyty_test(string_utils_tests)
+
 add_executable(page_manager_tests EXCLUDE_FROM_ALL
 	../tests/PageManagerTests.cpp
 	graphics/host_gpu/pageManager.cpp
