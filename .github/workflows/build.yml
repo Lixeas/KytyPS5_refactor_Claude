@@ -48,6 +48,22 @@ jobs:
           cache: true
           stripdown: true
 
+      # install_runtime only drops vulkan-1.dll into System32 when the installer actually runs, and a
+      # cache hit skips the installer while still restoring the SDK folder. Anything linking vulkan-1
+      # then dies at load with 0xC0000135 (STATUS_DLL_NOT_FOUND) -- green on the run that populates
+      # the cache, red on every run after. Put the SDK's own loader on PATH so it resolves either way.
+      - name: Make the Vulkan loader discoverable
+        shell: pwsh
+        run: |
+          $runtime = Join-Path $env:VULKAN_SDK 'runtime\x64'
+          $loader = Join-Path $runtime 'vulkan-1.dll'
+          if (-not (Test-Path $loader)) {
+            Write-Host "::error::vulkan-1.dll not found at $loader"
+            exit 1
+          }
+          Write-Host "Vulkan loader: $loader"
+          Add-Content -Path $env:GITHUB_PATH -Value $runtime
+
       - name: Install Qt
         uses: jurplel/install-qt-action@v4
         with:
