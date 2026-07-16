@@ -99,6 +99,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_C_COMPILER=clang-cl `
             -DCMAKE_CXX_COMPILER=clang-cl `
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON `
             -DCMAKE_PREFIX_PATH="$env:QT_ROOT_DIR"
 
       - name: Build emulator and launcher
@@ -115,6 +116,45 @@ jobs:
       # with VK_ERROR_INCOMPATIBLE_DRIVER. Everything else runs.
       - name: Run tests
         run: ctest --test-dir ${{ env.BUILD_DIR }} --output-on-failure --no-tests=error -LE gpu
+
+      # clang-tidy has never run on the supported build path. utils.cmake gates its in-build
+      # integration behind `NOT KYTY_CLANG_CL`, and clang-cl is the only toolchain CMake accepts, so
+      # the condition is always false -- the repo's rich .clang-tidy config has been dead in
+      # practice. Running clang-tidy standalone against the compile database sidesteps that gate
+      # without touching the build.
+      #
+      # Report-only and scoped to src/common for now. The backlog this surfaces has never been
+      # triaged, and its size is worth agreeing on before it gates anyone's PR. Widen the scope, then
+      # make it blocking, once the count is known and dealt with.
+      - name: clang-tidy (report only)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $db = Join-Path $env:BUILD_DIR 'compile_commands.json'
+          if (-not (Test-Path $db)) {
+            Write-Host "::error::$db not found; CMAKE_EXPORT_COMPILE_COMMANDS did not take effect"
+            exit 1
+          }
+          $files = Get-ChildItem -Path src/common -Filter *.cpp -Recurse | ForEach-Object FullName
+          Write-Host "Running clang-tidy over $($files.Count) files in src/common"
+          foreach ($f in $files) {
+            clang-tidy -p $env:BUILD_DIR --quiet $f *>&1 | Tee-Object -FilePath clang-tidy.log -Append
+          }
+          $count = 0
+          if (Test-Path clang-tidy.log) {
+            $count = (Select-String -Path clang-tidy.log -Pattern 'warning:').Count
+          }
+          Write-Host "::notice::clang-tidy: $count warnings across $($files.Count) files in src/common"
+
+      - name: Upload clang-tidy report
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: clang-tidy-report
+          path: clang-tidy.log
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Upload install tree
         if: success()
