@@ -20,10 +20,19 @@ function(include_what_you_use_with_mappings target dirs mappings)
 endfunction()
 
 function(clang_tidy_check target config headers dirs)
-  if (CLANG AND ("${target}" IN_LIST KYTY_CLANG_TYDY) AND NOT KYTY_CLANG_CL)
+  # clang-tidy used to be skipped whenever KYTY_CLANG_CL was set, which is every build the README
+  # supports, so the .clang-tidy config never actually ran. It is opt-in rather than on by default
+  # because the check carries -warnings-as-errors=* and the backlog it surfaces has never been
+  # triaged: turning it on unconditionally would break the build for everyone.
+  if (CLANG AND ("${target}" IN_LIST KYTY_CLANG_TYDY) AND KYTY_ENABLE_CLANG_TIDY)
     find_program (CLANG_TIDY_EXE NAMES "clang-tidy")
     if (CLANG_TIDY_EXE)
-		set(std_arg "-extra-arg=-std=c++${CMAKE_CXX_STANDARD}")
+		if (KYTY_CLANG_CL)
+			# clang-cl takes MSVC-style driver flags; clang-tidy needs the GNU-style driver.
+			set(std_arg "-extra-arg=--driver-mode=cl" "-extra-arg=-std=c++${CMAKE_CXX_STANDARD}")
+		else()
+			set(std_arg "-extra-arg=-std=c++${CMAKE_CXX_STANDARD}")
+		endif()
 		foreach(dir ${dirs})
 			list(APPEND incdirs "-extra-arg=-I${dir}")
 		endforeach()
@@ -63,7 +72,9 @@ endfunction()
 
 macro(config_compiler_and_linker)
 
-set(KYTY_WARNINGS_ARE_ERRORS OFF)
+# OFF by default: the warning backlog has never been triaged, so -Werror would break existing
+# builds. Exposed as an option so CI can hold new code to a higher bar than the tree currently meets.
+option(KYTY_WARNINGS_ARE_ERRORS "Treat compiler warnings as errors" OFF)
 
 set(KYTY_C_FLAGS "")
 set(KYTY_CPP_FLAGS "")

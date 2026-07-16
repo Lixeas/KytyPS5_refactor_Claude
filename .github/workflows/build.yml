@@ -1,0 +1,102 @@
+name: Build
+
+# The project supports exactly one toolchain (Windows x64 + clang-cl; cl.exe is rejected by CMake),
+# so there is a single build matrix entry on purpose.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  QT_VERSION: 6.8.1
+  VULKAN_SDK_VERSION: 1.3.296.0
+  BUILD_DIR: _Build/ci
+
+jobs:
+  build:
+    name: Windows x64 (clang-cl)
+    runs-on: windows-2022
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up MSVC environment (x64)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Set up Ninja
+        uses: seanmiddleditch/gha-setup-ninja@v5
+
+      - name: Install Vulkan SDK
+        uses: jakoch/install-vulkan-sdk-action@v1
+        with:
+          vulkan_version: ${{ env.VULKAN_SDK_VERSION }}
+          install_runtime: true
+          cache: true
+          stripdown: true
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          cache: true
+
+      # clang-cl ships with the VS "C++ Clang tools for Windows" component. Resolve it explicitly so
+      # a missing component fails here with a clear message instead of surfacing as a confusing
+      # CMake compiler-detection error 200 lines into the log.
+      - name: Locate clang-cl
+        shell: pwsh
+        run: |
+          $candidates = @(
+            (Join-Path $env:VCINSTALLDIR 'Tools\Llvm\x64\bin'),
+            (Join-Path ${env:ProgramFiles} 'LLVM\bin')
+          )
+          $found = $candidates | Where-Object { $_ -and (Test-Path (Join-Path $_ 'clang-cl.exe')) } | Select-Object -First 1
+          if (-not $found) {
+            Write-Host "::error::clang-cl.exe not found. Looked in:`n$($candidates -join "`n")"
+            exit 1
+          }
+          Write-Host "clang-cl found in $found"
+          & (Join-Path $found 'clang-cl.exe') --version
+          Add-Content -Path $env:GITHUB_PATH -Value $found
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          cmake -S src -B $env:BUILD_DIR -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_C_COMPILER=clang-cl `
+            -DCMAKE_CXX_COMPILER=clang-cl `
+            -DCMAKE_PREFIX_PATH="$env:QT_ROOT_DIR"
+
+      - name: Build emulator and launcher
+        run: cmake --build ${{ env.BUILD_DIR }} --target launcher
+
+      - name: Install
+        run: cmake --install ${{ env.BUILD_DIR }} --prefix ${{ env.BUILD_DIR }}/install
+
+      # Test binaries are EXCLUDE_FROM_ALL, so ctest cannot build them itself.
+      - name: Build tests
+        run: cmake --build ${{ env.BUILD_DIR }} --target kyty_tests
+
+      - name: Run tests
+        run: ctest --test-dir ${{ env.BUILD_DIR }} --output-on-failure --no-tests=error
+
+      - name: Upload install tree
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kytyps5-windows-x64
+          path: ${{ env.BUILD_DIR }}/install
+          retention-days: 7

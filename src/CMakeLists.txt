@@ -131,6 +131,10 @@ if (CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 12.0.0)
 endif()
 
 option(KYTY_BUILD_LAUNCHER "Build Qt launcher" ON)
+
+# OFF by default: clang_tidy_check runs with -warnings-as-errors=*, and the tree has never been built
+# against .clang-tidy (the check was skipped on every clang-cl build), so the backlog is unknown.
+option(KYTY_ENABLE_CLANG_TIDY "Run clang-tidy as part of the build" OFF)
   
 config_compiler_and_linker()  
   
@@ -209,6 +213,22 @@ list(APPEND check_headers
 	${CMAKE_CURRENT_SOURCE_DIR}
 )
 
+enable_testing()
+
+# Tests are EXCLUDE_FROM_ALL, so `ctest` alone cannot build them. Depend on kyty_tests to build the
+# whole suite, then run it:
+#
+#   cmake --build <dir> --target kyty_tests
+#   ctest --test-dir <dir> --output-on-failure
+add_custom_target(kyty_tests)
+
+# Registers an already-defined test executable with CTest and attaches it to the kyty_tests target.
+# Each test binary is a standalone main() that returns non-zero on failure.
+function(add_kyty_test target)
+	add_test(NAME ${target} COMMAND ${target})
+	add_dependencies(kyty_tests ${target})
+endfunction()
+
 function(add_kyty_full_emulator_test target source)
 	add_executable(${target} EXCLUDE_FROM_ALL ${source} ${kyty_emulator_src})
 	target_link_libraries(${target} ${kyty_emulator_link_libraries})
@@ -220,6 +240,7 @@ function(add_kyty_full_emulator_test target source)
 		target_link_libraries(${target} onecore)
 		add_custom_command(TARGET ${target} POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different "${KYTY_THIRD_PARTY_DIR}/winpthread/bin/libwinpthread-1.dll" $<TARGET_FILE_DIR:${target}>/libwinpthread-1.dll)
 	endif()
+	add_kyty_test(${target})
 endfunction()
 
 add_kyty_full_emulator_test(shader_cfg_tests ../tests/shaderCfgTests.cpp)
@@ -232,12 +253,20 @@ add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 )
 target_link_libraries(scalar_provenance_tests fmt::fmt)
 target_include_directories(scalar_provenance_tests PRIVATE ${inc_headers})
+add_kyty_test(scalar_provenance_tests)
+
+add_executable(singleton_tests EXCLUDE_FROM_ALL
+	../tests/SingletonTests.cpp
+)
+target_include_directories(singleton_tests PRIVATE ${inc_headers})
+add_kyty_test(singleton_tests)
 
 add_executable(page_manager_tests EXCLUDE_FROM_ALL
 	../tests/PageManagerTests.cpp
 	graphics/host_gpu/pageManager.cpp
 )
 target_include_directories(page_manager_tests PRIVATE ${inc_headers})
+add_kyty_test(page_manager_tests)
 
 add_executable(memory_tracker_tests EXCLUDE_FROM_ALL
 	../tests/MemoryTrackerTests.cpp
@@ -247,6 +276,7 @@ add_executable(memory_tracker_tests EXCLUDE_FROM_ALL
 target_link_libraries(memory_tracker_tests fmt::fmt common)
 target_include_directories(memory_tracker_tests PRIVATE ${inc_headers})
 target_compile_definitions(memory_tracker_tests PRIVATE KYTY_MEMORY_TRACKER_TESTS=1)
+add_kyty_test(memory_tracker_tests)
 
 add_executable(shader_vertex_metadata_tests EXCLUDE_FROM_ALL
 	../tests/ShaderVertexMetadataTests.cpp
@@ -254,6 +284,7 @@ add_executable(shader_vertex_metadata_tests EXCLUDE_FROM_ALL
 	graphics/shader/shaderVertexMetadata.cpp
 )
 target_include_directories(shader_vertex_metadata_tests PRIVATE ${inc_headers})
+add_kyty_test(shader_vertex_metadata_tests)
 
 add_executable(shader_stage_runtime_tests EXCLUDE_FROM_ALL
 	../tests/ShaderStageRuntimeTests.cpp
@@ -266,6 +297,7 @@ add_executable(shader_stage_runtime_tests EXCLUDE_FROM_ALL
 )
 target_link_libraries(shader_stage_runtime_tests fmt::fmt)
 target_include_directories(shader_stage_runtime_tests PRIVATE ${inc_headers})
+add_kyty_test(shader_stage_runtime_tests)
 
 add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
 	../tests/ResourceTrackingTests.cpp
@@ -281,6 +313,7 @@ add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
 )
 target_link_libraries(resource_tracking_tests fmt::fmt)
 target_include_directories(resource_tracking_tests PRIVATE ${inc_headers})
+add_kyty_test(resource_tracking_tests)
 
 add_executable(resource_mutex_tests EXCLUDE_FROM_ALL
 	../tests/ResourceMutexTests.cpp
@@ -288,6 +321,7 @@ add_executable(resource_mutex_tests EXCLUDE_FROM_ALL
 )
 target_link_libraries(resource_mutex_tests common)
 target_include_directories(resource_mutex_tests PRIVATE ${inc_headers})
+add_kyty_test(resource_mutex_tests)
 
 add_kyty_full_emulator_test(shader_recompiler_compute_tests ../tests/ShaderRecompilerComputeTests.cpp)
 
