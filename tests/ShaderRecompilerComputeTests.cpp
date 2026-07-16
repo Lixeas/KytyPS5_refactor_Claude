@@ -188,9 +188,12 @@ constexpr u32 EncodeVopcSdwa(u32 src0, u32 sdst = 0, u32 sd = 0,
          ((src1_abs & 0x1u) << 29u) | ((s1 & 0x1u) << 31u);
 }
 
+// MUBUF OP is [25:18] -- 8 bits, all in word0. Masking to 7 dropped bit 7, so opcodes 128-135 (the
+// BUFFER_*_FORMAT_D16_* variants) silently encoded as 0-7 instead: real, supported opcodes. A test
+// written against a D16 op would have quietly exercised BUFFER_LOAD_FORMAT_X and passed.
 constexpr u32 EncodeMubuf0(u32 opcode, u32 offset = 0, bool idxen = false,
                            bool offen = true, bool glc = false) {
-  return (0x38u << 26u) | ((opcode & 0x7fu) << 18u) |
+  return (0x38u << 26u) | ((opcode & 0xffu) << 18u) |
          (offen ? (1u << 12u) : 0u) | (idxen ? (1u << 13u) : 0u) |
          (glc ? (1u << 14u) : 0u) | (offset & 0xfffu);
 }
