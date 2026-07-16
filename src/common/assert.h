@@ -9,23 +9,16 @@
 
 namespace Common {
 
-#ifdef __clang__
-int DbgExitHandler(char const* file, int line, std::string_view text)
-    __attribute__((analyzer_noreturn));
-int DbgExitHandler(char const* file, int line, fmt::text_style style, std::string_view text)
-    __attribute__((analyzer_noreturn));
-int DbgExitIfHandler(char const* expr, char const* file, int line)
-    __attribute__((analyzer_noreturn));
-int DbgNotImplementedHandler(char const* expr, char const* file, int line)
-    __attribute__((analyzer_noreturn));
-void DbgExit(int status) __attribute__((analyzer_noreturn));
-#else
-int  DbgExitHandler(char const* file, int line, std::string_view text);
-int  DbgExitHandler(char const* file, int line, fmt::text_style style, std::string_view text);
-int  DbgExitIfHandler(char const* expr, char const* file, int line);
-int  DbgNotImplementedHandler(char const* expr, char const* file, int line);
-void DbgExit(int status);
-#endif
+// The handlers report and return; DbgExit is the one that halts. Marking it [[noreturn]] is what
+// lets the compiler see the EXIT macros below as terminating, which the previous
+// analyzer_noreturn attribute never did -- that one only ever spoke to Clang's static analyzer,
+// leaving codegen to believe every EXIT() could fall through.
+int DbgExitHandler(char const* file, int line, std::string_view text);
+int DbgExitHandler(char const* file, int line, fmt::text_style style, std::string_view text);
+int DbgExitIfHandler(char const* expr, char const* file, int line);
+int DbgNotImplementedHandler(char const* expr, char const* file, int line);
+
+[[noreturn]] void DbgExit(int status);
 
 } // namespace Common
 
@@ -37,7 +30,12 @@ void DbgExit(int status);
 
 #ifndef KYTY_FINAL
 #define EXIT_IF(x)                                                                                 \
-	((void)((x) && Common::DbgExitIfHandler(#x, __FILE__, __LINE__) != 0 && (EXIT_HALT(), 1) != 0))
+	do {                                                                                           \
+		if (x) {                                                                                   \
+			(void)Common::DbgExitIfHandler(#x, __FILE__, __LINE__);                                \
+			(void)EXIT_HALT();                                                                     \
+		}                                                                                          \
+	} while (0)
 #else
 #define EXIT_IF(x)                                                                                 \
 	do {                                                                                           \
@@ -46,22 +44,29 @@ void DbgExit(int status);
 	} while (0)
 #endif
 
+// EXIT_HALT() is reached unconditionally, so these expand to something the compiler can prove
+// never returns. The reporting call used to gate it behind &&, which meant every caller ending in
+// EXIT() was a non-void function falling off its end -- undefined behaviour, and 49 -Wreturn-type
+// warnings.
 #define EXIT(...)                                                                                  \
 	do {                                                                                           \
-		((void)(Common::DbgExitHandler(__FILE__, __LINE__, ::fmt::sprintf(__VA_ARGS__)) &&         \
-		        (EXIT_HALT(), 1)));                                                                \
+		(void)Common::DbgExitHandler(__FILE__, __LINE__, ::fmt::sprintf(__VA_ARGS__));             \
+		(void)EXIT_HALT();                                                                         \
 	} while (0)
 
 #define EXIT_COLOR(style, ...)                                                                     \
 	do {                                                                                           \
-		((void)(Common::DbgExitHandler(__FILE__, __LINE__, (style),                                \
-		                               ::fmt::sprintf(__VA_ARGS__)) &&                             \
-		        (EXIT_HALT(), 1)));                                                                \
+		(void)Common::DbgExitHandler(__FILE__, __LINE__, (style), ::fmt::sprintf(__VA_ARGS__));    \
+		(void)EXIT_HALT();                                                                         \
 	} while (0)
 
 #define EXIT_NOT_IMPLEMENTED(x)                                                                    \
-	((void)((x) && Common::DbgNotImplementedHandler(#x, __FILE__, __LINE__) != 0 &&                \
-	        (EXIT_HALT(), 1) != 0))
+	do {                                                                                           \
+		if (x) {                                                                                   \
+			(void)Common::DbgNotImplementedHandler(#x, __FILE__, __LINE__);                        \
+			(void)EXIT_HALT();                                                                     \
+		}                                                                                          \
+	} while (0)
 #define KYTY_NOT_IMPLEMENTED EXIT_NOT_IMPLEMENTED(true)
 
 #endif /* KYTY_COMMON_ASSERT_H_ */
