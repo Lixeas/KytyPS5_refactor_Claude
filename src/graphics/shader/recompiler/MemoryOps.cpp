@@ -267,6 +267,8 @@ bool DecodeMubuf(uint32_t pc, std::span<const uint32_t> code, uint32_t word_inde
 	const uint32_t word0   = code[word_index];
 	const uint32_t word1   = code[word_index + 1u];
 	const uint32_t opcode  = ((word0 >> 18u) & 0x7fu) | (((word0 >> 25u) & 1u) << 7u);
+	const uint32_t lds     = (word0 >> 16u) & 1u;
+	const uint32_t tfe     = (word1 >> 23u) & 1u;
 	const uint32_t vdata   = (word1 >> 8u) & 0xffu;
 	const uint32_t vaddr   = word1 & 0xffu;
 	const uint32_t srsrc   = (word1 >> 16u) & 0x1fu;
@@ -288,6 +290,13 @@ bool DecodeMubuf(uint32_t pc, std::span<const uint32_t> code, uint32_t word_inde
 	SetRawWords(inst, code, word_index, 2);
 	if (inst->opcode == Opcode::Unsupported) {
 		MarkMemoryUnsupported(inst, Family::MUBUF, opcode, "MUBUF opcode is not implemented");
+	} else if (lds != 0 || tfe != 0) {
+		// LDS sends the data to LDS instead of a VGPR and TFE adds a return VGPR, so ignoring
+		// either silently produces wrong results rather than failing. DecodeFlat below already
+		// rejects its own LDS bit; this is the same contract. GLC/SLC are decoded and honoured,
+		// and DLC is a cache hint that cannot change the data, so neither is rejected here.
+		MarkMemoryUnsupported(inst, Family::MUBUF, opcode,
+		                      "MUBUF LDS and TFE modifiers are not implemented");
 	}
 
 	DecodeVectorGpr(vdata, &inst->dst, nullptr);
@@ -312,6 +321,7 @@ bool DecodeMtbuf(uint32_t pc, std::span<const uint32_t> code, uint32_t word_inde
 	const uint32_t opcode  = ((word0 >> 16u) & 0x7u) | (((word1 >> 21u) & 1u) << 3u);
 	const uint32_t dfmt    = (word0 >> 19u) & 0xfu;
 	const uint32_t nfmt    = (word0 >> 23u) & 0x7u;
+	const uint32_t tfe     = (word1 >> 23u) & 1u;
 	const uint32_t vdata   = (word1 >> 8u) & 0xffu;
 	const uint32_t vaddr   = word1 & 0xffu;
 	const uint32_t srsrc   = (word1 >> 16u) & 0x1fu;
@@ -335,6 +345,10 @@ bool DecodeMtbuf(uint32_t pc, std::span<const uint32_t> code, uint32_t word_inde
 	SetRawWords(inst, code, word_index, 2);
 	if (inst->opcode == Opcode::Unsupported) {
 		MarkMemoryUnsupported(inst, Family::MTBUF, opcode, "MTBUF opcode is not implemented");
+	} else if (tfe != 0) {
+		// Same reasoning as DecodeMubuf: TFE adds a return VGPR. MTBUF has no LDS bit.
+		MarkMemoryUnsupported(inst, Family::MTBUF, opcode,
+		                      "MTBUF TFE modifier is not implemented");
 	}
 
 	DecodeVectorGpr(vdata, &inst->dst, nullptr);
