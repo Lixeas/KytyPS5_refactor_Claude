@@ -12,7 +12,12 @@ permissions:
 
 env:
   QT_VERSION: 6.8.1
-  VULKAN_SDK_VERSION: 1.3.296.0
+  # Must track the 3rdparty/Vulkan-Headers submodule (currently vulkan-sdk-1.4.335.0). The bundled
+  # headers come first on the include path, so vulkan_core.h resolves to the submodule while
+  # vk_enum_string_helper.h -- which Vulkan-Headers no longer ships -- resolves to the SDK. A version
+  # gap between the two makes the SDK helper reference enum values the bundled core header does not
+  # declare. Bump this together with the submodule.
+  VULKAN_SDK_VERSION: 1.4.335.0
   BUILD_DIR: _Build/ci
 
 jobs:
