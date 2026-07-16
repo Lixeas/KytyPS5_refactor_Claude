@@ -4,6 +4,7 @@
 #include "common/logging/log.h"
 #include "common/singleton.h"
 #include "common/stringUtils.h"
+#include "common/threads.h"
 #include "graphics/host_gpu/hostMemory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
@@ -49,7 +50,11 @@ struct CxaDestructor {
 	void*                 module_id;
 };
 
+// The Itanium C++ ABI requires __cxa_atexit to be callable from several threads at once: guest code
+// reaches it through every function-local static with a destructor. Both lists are therefore guarded
+// by the mutex, which is never held while a guest callback runs (a callback may register more).
 struct CContext {
+	Common::Mutex            mutex;
 	std::list<CxaDestructor> cxa;
 	std::list<atexit_func_t> atexit;
 };
@@ -72,8 +77,34 @@ const char** GetArgv() {
 	return const_cast<const char**>(g_argv);
 }
 
+// Runs the handlers the guest registered through atexit(), most recently registered first as C
+// requires. Each handler is claimed under the lock and called with the lock released, because a
+// handler may register another one.
+static void RunAtexitHandlers() {
+	auto* cc = Common::Singleton<CContext>::Instance();
+
+	for (;;) {
+		atexit_func_t func = nullptr;
+
+		{
+			Common::LockGuard lock(cc->mutex);
+			if (cc->atexit.empty()) {
+				break;
+			}
+			func = cc->atexit.front();
+			cc->atexit.pop_front();
+		}
+
+		if (func != nullptr) {
+			func();
+		}
+	}
+}
+
 static KYTY_SYSV_ABI void exit(int code) {
 	PRINT_NAME();
+
+	RunAtexitHandlers();
 
 	::exit(code);
 }
@@ -292,7 +323,9 @@ static KYTY_SYSV_ABI int atexit(atexit_func_t func) {
 	PRINT_NAME();
 
 	if (func != nullptr) {
-		Common::Singleton<CContext>::Instance()->atexit.push_front(func);
+		auto*             cc = Common::Singleton<CContext>::Instance();
+		Common::LockGuard lock(cc->mutex);
+		cc->atexit.push_front(func);
 	}
 
 	return 0;
@@ -594,6 +627,7 @@ static KYTY_SYSV_ABI int cxa_atexit(cxa_destructor_func_t func, void* arg, void*
 	c.destructor_object = arg;
 	c.module_id         = d;
 
+	Common::LockGuard lock(cc->mutex);
 	cc->cxa.push_back(c);
 
 	return 0;
@@ -604,14 +638,32 @@ void KYTY_SYSV_ABI cxa_finalize(void* d) {
 
 	auto* cc = Common::Singleton<CContext>::Instance();
 
-	for (auto i = cc->cxa.rbegin(); i != cc->cxa.rend(); ++i) {
-		auto& c = *i;
-		if ((d == nullptr || c.module_id == d) && c.destructor_func != nullptr) {
-			auto* func        = c.destructor_func;
-			auto* object      = c.destructor_object;
-			c.destructor_func = nullptr;
-			func(object);
+	// Destructors run in reverse registration order, each one claimed under the lock and invoked
+	// with the lock released: a destructor may register another one or re-enter cxa_finalize.
+	// Clearing destructor_func before the call is what keeps an entry from running twice when two
+	// threads finalize the same module concurrently.
+	for (;;) {
+		cxa_destructor_func_t func   = nullptr;
+		void*                 object = nullptr;
+
+		{
+			Common::LockGuard lock(cc->mutex);
+			for (auto i = cc->cxa.rbegin(); i != cc->cxa.rend(); ++i) {
+				auto& c = *i;
+				if ((d == nullptr || c.module_id == d) && c.destructor_func != nullptr) {
+					func              = c.destructor_func;
+					object            = c.destructor_object;
+					c.destructor_func = nullptr;
+					break;
+				}
+			}
 		}
+
+		if (func == nullptr) {
+			break;
+		}
+
+		func(object);
 	}
 }
 
