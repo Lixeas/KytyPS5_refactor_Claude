@@ -95,8 +95,10 @@ jobs:
       - name: Build tests
         run: cmake --build ${{ env.BUILD_DIR }} --target kyty_tests
 
+      # -LE gpu skips the tests that need a real Vulkan device; the runner has no GPU, so they fail
+      # with VK_ERROR_INCOMPATIBLE_DRIVER. Everything else runs.
       - name: Run tests
-        run: ctest --test-dir ${{ env.BUILD_DIR }} --output-on-failure --no-tests=error
+        run: ctest --test-dir ${{ env.BUILD_DIR }} --output-on-failure --no-tests=error -LE gpu
 
       - name: Upload install tree
         if: success()

@@ -324,6 +324,10 @@ target_include_directories(resource_mutex_tests PRIVATE ${inc_headers})
 add_kyty_test(resource_mutex_tests)
 
 add_kyty_full_emulator_test(shader_recompiler_compute_tests ../tests/ShaderRecompilerComputeTests.cpp)
+# Needs a real Vulkan device: the harness creates an instance and dispatches a compute shader, so it
+# fails with VK_ERROR_INCOMPATIBLE_DRIVER on a machine without a GPU. Labelled so those environments
+# can skip it with `ctest -LE gpu`, which is how CI runs it.
+set_tests_properties(shader_recompiler_compute_tests PROPERTIES LABELS gpu)
 
 add_kyty_full_emulator_test(virtual_memory_allocation_tests ../tests/VirtualMemoryAllocationTests.cpp)
 
