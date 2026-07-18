@@ -4101,6 +4101,34 @@ TestCase VectorVop3MoveAppliesFloatSourceModifiers() {
   return test;
 }
 
+// The VOP3 source modifiers (neg/abs) and the omod output multiplier are exercised elsewhere
+// (VectorVop3MoveAppliesFloatSourceModifiers, VectorFloatArithmeticOps), but the CLMP result
+// modifier had no coverage. CLMP saturates the float result to [0,1] after omod. This checks both
+// ends: 3.0 clamps down to 1.0 and -3.0 clamps up to 0.0. Without the clamp the results would be
+// 3.0 and -3.0, so the case only passes if it is actually emitted.
+TestCase Vop3AppliesResultClamp() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendSMovLiteral(&code, 24, 0x40400000u);  // 3.0
+  AppendSMovLiteral(&code, 25, 0x00000000u);  // 0.0
+  AppendSMovLiteral(&code, 26, 0xc0400000u);  // -3.0
+  // V_ADD_F32 (VOP3 0x103) with CLMP: clamp(3.0 + 0.0) = 1.0.
+  AppendVop3(&code, 0x103, 1, 24, 25, 0, 0, 0, true, 0, 0);
+  AppendStoreVgpr(&code, 1, 0);
+  // V_ADD_F32 with CLMP: clamp(-3.0 + 0.0) = 0.0.
+  AppendVop3(&code, 0x103, 2, 26, 25, 0, 0, 0, true, 0, 0);
+  AppendStoreVgpr(&code, 2, 1);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "Vop3AppliesResultClamp";
+  test.code = code;
+  test.expected = {0x3f800000u, 0x00000000u};
+  test.opcodes = {O::SMovB32, O::VAddF32, O::BufferStoreDword, O::SEndpgm};
+  return test;
+}
+
 TestCase VectorIntegerOps() {
   using O = ShaderOpcode;
 
@@ -7429,6 +7457,61 @@ TestCase DsReadWrite2Variants() {
            O::SEndpgm}};
 }
 
+// Regression test for the st64 stride. DS_*2ST64_B32/B64 multiply their two offsets by 64 relative
+// to the non-st64 form (RDNA2 ISA: DS_READ2ST64_B32 reads MEM[ADDR + OFFSET * 4 * 64]). The lowering
+// ignored that -- st64 was routed to the same LowerDsRead2/LowerDsWrite2 path as non-st64, so the
+// factor was 1. The existing DsReadWrite2Variants case does not catch it because it writes and reads
+// with the *same* st64 op: a symmetric round-trip coincides at any stride. These cases break the
+// symmetry -- write with st64, read the absolute address back with the non-st64 op (and vice versa)
+// -- so they only pass if the x64 stride is actually applied.
+TestCase DsWrite2St64UsesLargeStride() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 1, 0);
+  AppendVMovLiteral(&code, 2, 0xaabbccddu);
+  AppendVMovLiteral(&code, 3, 0x11223344u);
+  // DS_WRITE2ST64_B32 (0x0f), offset0=0 offset1=1: data0 -> dword 0, data1 -> dword 1*64 = 64.
+  code.push_back(EncodeDs0(0x0f, (1u << 8u) | 0u));
+  code.push_back(EncodeDs1Ex(0, 3, 2, 1));
+  // DS_READ2_B32 (0x37, no st64), offset0=0 offset1=64: reads dword 0 and dword 64 absolutely.
+  code.push_back(EncodeDs0(0x37, (64u << 8u) | 0u));
+  code.push_back(EncodeDs1Ex(4, 0, 0, 1));
+  AppendStoreVgpr(&code, 4, 0);
+  AppendStoreVgpr(&code, 5, 1);
+  AppendEnd(&code);
+
+  return {"DsWrite2St64UsesLargeStride",
+          code,
+          std::vector<u32>(2, 0),
+          {0xaabbccddu, 0x11223344u},
+          {O::VMovB32, O::DsWrite2St64B32, O::DsRead2B32, O::BufferStoreDword, O::SEndpgm}};
+}
+
+TestCase DsRead2St64UsesLargeStride() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 1, 0);
+  AppendVMovLiteral(&code, 2, 0x55667788u);
+  AppendVMovLiteral(&code, 3, 0x99aabbccu);
+  // DS_WRITE2_B32 (0x0e, no st64), offset0=0 offset1=64: data0 -> dword 0, data1 -> dword 64.
+  code.push_back(EncodeDs0(0x0e, (64u << 8u) | 0u));
+  code.push_back(EncodeDs1Ex(0, 3, 2, 1));
+  // DS_READ2ST64_B32 (0x38), offset0=0 offset1=1: reads dword 0 and dword 1*64 = 64.
+  code.push_back(EncodeDs0(0x38, (1u << 8u) | 0u));
+  code.push_back(EncodeDs1Ex(4, 0, 0, 1));
+  AppendStoreVgpr(&code, 4, 0);
+  AppendStoreVgpr(&code, 5, 1);
+  AppendEnd(&code);
+
+  return {"DsRead2St64UsesLargeStride",
+          code,
+          std::vector<u32>(2, 0),
+          {0x55667788u, 0x99aabbccu},
+          {O::VMovB32, O::DsWrite2B32, O::DsRead2B32, O::BufferStoreDword, O::SEndpgm}};
+}
+
 TestCase DsAtomicNoReturnVariants() {
   using O = ShaderOpcode;
 
@@ -8762,6 +8845,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ScalarLiteral);
   AddCase(VectorMoves);
   AddCase(VectorVop3MoveAppliesFloatSourceModifiers);
+  AddCase(Vop3AppliesResultClamp);
   AddCase(VectorIntegerOps);
   AddCase(VectorShiftCountsMaskLowBits);
   AddCase(VectorVop3IntegerOps);
@@ -8876,6 +8960,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(DsAppendUsesEncodedGdsSelector);
   AddCase(DsGdsSubdwordAndAtomicWrites);
   AddCase(DsReadWrite2Variants);
+  AddCase(DsWrite2St64UsesLargeStride);
+  AddCase(DsRead2St64UsesLargeStride);
   AddCase(DsAtomicNoReturnVariants);
   AddCase(DsAtomicReturnVariants);
   AddCase(DsMiscVariants);
