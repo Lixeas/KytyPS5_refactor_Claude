@@ -5,11 +5,13 @@
 #include "common/profiler.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/colorRenderTarget.h"
+#include "graphics/host_gpu/renderer/debug.h"
+#include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/descriptorCache.h"
 #include "graphics/host_gpu/renderer/framebufferCache.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
-#include "graphics/host_gpu/renderer/renderState.h"
 #include "graphics/host_gpu/utils.h"
 #include "graphics/host_gpu/vma.h"
 #include "graphics/presentation/window.h"
@@ -38,10 +40,10 @@ public:
 		}
 		return m_pool[id];
 	}
+	void DeleteAll();
 
 private:
 	void Create(int id);
-	void DeleteAll();
 
 	VulkanCommandPool* m_pool[GraphicContext::QUEUES_NUM] = {};
 };
@@ -74,6 +76,12 @@ void GraphicsRenderInit() {
 	EXIT_IF(g_render_ctx != nullptr);
 
 	g_render_ctx = new RenderContext;
+}
+
+void GraphicsRenderReleaseThreadCommandPools() {
+	if (g_render_ctx != nullptr) {
+		g_command_pool.DeleteAll();
+	}
 }
 
 void GraphicsRenderCreateContext() {
@@ -330,8 +338,9 @@ void CommandBuffer::Execute() {
 		queue.mutex->Unlock();
 	}
 
-	m_execute    = true;
-	m_submit_seq = g_command_buffer_submit_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+	m_execute      = true;
+	m_fence_waited = false;
+	m_submit_seq   = g_command_buffer_submit_seq.fetch_add(1, std::memory_order_relaxed) + 1;
 
 	if (result != VK_SUCCESS) {
 		LOGF("vkQueueSubmit failed: %s (%d), queue=%d index=%u submit_seq=%" PRIu64
@@ -393,8 +402,9 @@ void CommandBuffer::ExecuteWithSemaphore(VkSemaphore signal_semaphore) {
 		queue.mutex->Unlock();
 	}
 
-	m_execute    = true;
-	m_submit_seq = g_command_buffer_submit_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+	m_execute      = true;
+	m_fence_waited = false;
+	m_submit_seq   = g_command_buffer_submit_seq.fetch_add(1, std::memory_order_relaxed) + 1;
 
 	if (result != VK_SUCCESS) {
 		LOGF("vkQueueSubmit failed: %s (%d), queue=%d index=%u submit_seq=%" PRIu64
@@ -460,8 +470,9 @@ void CommandBuffer::ExecuteWithSemaphore(VkSemaphore          wait_semaphore,
 		queue.mutex->Unlock();
 	}
 
-	m_execute    = true;
-	m_submit_seq = g_command_buffer_submit_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+	m_execute      = true;
+	m_fence_waited = false;
+	m_submit_seq   = g_command_buffer_submit_seq.fetch_add(1, std::memory_order_relaxed) + 1;
 
 	if (result != VK_SUCCESS) {
 		LOGF("vkQueueSubmit failed: %s (%d), queue=%d index=%u submit_seq=%" PRIu64
@@ -474,27 +485,11 @@ void CommandBuffer::ExecuteWithSemaphore(VkSemaphore          wait_semaphore,
 }
 
 void CommandBuffer::WaitForFence() {
-	EXIT_IF(IsInvalid());
-
 	const bool was_executed = m_execute;
-	if (m_execute) {
-		auto* device = g_render_ctx->GetGraphicCtx()->device;
-
-		auto result = vkWaitForFences(device, 1, &m_pool->fences[m_index], VK_TRUE, UINT64_MAX);
-		if (result != VK_SUCCESS) {
-			LOGF("vkWaitForFences failed: %s (%d), wait=WaitForFence queue=%d index=%u "
-			     "submit_seq=%" PRIu64 " debug_op=%u debug_submit=%" PRIu64
-			     " args=%u,%u,%u,%u,0x%016" PRIx64 "\n",
-			     string_VkResult(result), static_cast<int>(result), m_queue, m_index, m_submit_seq,
-			     m_debug_op, m_debug_submit_id, m_debug_arg0, m_debug_arg1, m_debug_arg2,
-			     m_debug_arg3, m_debug_arg4);
-		}
-		EXIT_NOT_IMPLEMENTED(result != VK_SUCCESS);
-
-		m_execute = false;
-	}
-
+	WaitForFenceOnly();
 	if (was_executed) {
+		m_execute      = false;
+		m_fence_waited = false;
 		RecycleDescriptorsAfterFence();
 		m_fence_resources.ReleaseAfterFence();
 	}
@@ -505,32 +500,35 @@ void CommandBuffer::WaitForFence() {
 	m_delete_after_fence.clear();
 }
 
-void CommandBuffer::WaitForFenceAndReset() {
+void CommandBuffer::WaitForFenceOnly() {
 	EXIT_IF(IsInvalid());
+	if (!m_execute || m_fence_waited) {
+		return;
+	}
+	auto* device = g_render_ctx->GetGraphicCtx()->device;
+	auto  result = vkWaitForFences(device, 1, &m_pool->fences[m_index], VK_TRUE, UINT64_MAX);
+	if (result != VK_SUCCESS) {
+		LOGF("vkWaitForFences failed: %s (%d), queue=%d index=%u submit_seq=%" PRIu64
+		     " debug_op=%u debug_submit=%" PRIu64 " args=%u,%u,%u,%u,0x%016" PRIx64 "\n",
+		     string_VkResult(result), static_cast<int>(result), m_queue, m_index, m_submit_seq,
+		     m_debug_op, m_debug_submit_id, m_debug_arg0, m_debug_arg1, m_debug_arg2, m_debug_arg3,
+		     m_debug_arg4);
+	}
+	EXIT_NOT_IMPLEMENTED(result != VK_SUCCESS);
+	m_fence_waited = true;
+}
 
+void CommandBuffer::WaitForFenceAndReset() {
 	const bool was_executed = m_execute;
-	if (m_execute) {
-		auto* device = g_render_ctx->GetGraphicCtx()->device;
-
-		auto result = vkWaitForFences(device, 1, &m_pool->fences[m_index], VK_TRUE, UINT64_MAX);
-		if (result != VK_SUCCESS) {
-			LOGF("vkWaitForFences failed: %s (%d), wait=WaitForFenceAndReset queue=%d index=%u "
-			     "submit_seq=%" PRIu64 " debug_op=%u debug_submit=%" PRIu64
-			     " args=%u,%u,%u,%u,0x%016" PRIx64 "\n",
-			     string_VkResult(result), static_cast<int>(result), m_queue, m_index, m_submit_seq,
-			     m_debug_op, m_debug_submit_id, m_debug_arg0, m_debug_arg1, m_debug_arg2,
-			     m_debug_arg3, m_debug_arg4);
-		}
-		EXIT_NOT_IMPLEMENTED(result != VK_SUCCESS);
-
-		m_execute = false;
-
+	WaitForFenceOnly();
+	if (was_executed) {
+		m_execute      = false;
+		m_fence_waited = false;
 		vkResetCommandBuffer(m_pool->buffers[m_index],
 		                     VK_COMMAND_BUFFER_RESET_RELEASE_RESOURCES_BIT);
+		m_recording_generation++;
 	}
-
 	m_host_stream.Reset();
-
 	if (was_executed) {
 		RecycleDescriptorsAfterFence();
 		m_fence_resources.ReleaseAfterFence();
@@ -608,7 +606,7 @@ void CommandBuffer::BeginRenderPass(VulkanFramebuffer* framebuffer, RenderColorI
 			image_memory_barrier.subresourceRange.baseMipLevel   = 0;
 			image_memory_barrier.subresourceRange.levelCount     = VK_REMAINING_MIP_LEVELS;
 			image_memory_barrier.subresourceRange.baseArrayLayer = 0;
-			image_memory_barrier.subresourceRange.layerCount     = 1;
+			image_memory_barrier.subresourceRange.layerCount     = colors[i].vulkan_buffer->layers;
 
 			vkCmdPipelineBarrier(buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
 			                     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0,
@@ -646,7 +644,7 @@ void CommandBuffer::BeginRenderPass(VulkanFramebuffer* framebuffer, RenderColorI
 		image_memory_barrier.subresourceRange.baseMipLevel   = 0;
 		image_memory_barrier.subresourceRange.levelCount     = 1;
 		image_memory_barrier.subresourceRange.baseArrayLayer = 0;
-		image_memory_barrier.subresourceRange.layerCount     = 1;
+		image_memory_barrier.subresourceRange.layerCount     = depth->vulkan_buffer->layers;
 
 		vkCmdPipelineBarrier(
 		    buffer, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,

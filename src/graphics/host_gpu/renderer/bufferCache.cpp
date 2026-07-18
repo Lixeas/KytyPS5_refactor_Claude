@@ -16,7 +16,6 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -28,7 +27,7 @@ namespace Libs::Graphics {
 namespace {
 thread_local const void* g_cache_lock_owner = nullptr;
 
-constexpr uint32_t READBACK_MAX_RANGES    = 256;
+constexpr uint32_t READBACK_MAX_RANGES     = 256;
 constexpr uint64_t READBACK_COPY_ALIGNMENT = 64;
 constexpr uint64_t READBACK_CAPACITY =
     TRACKER_PAGE_SIZE + READBACK_MAX_RANGES * (READBACK_COPY_ALIGNMENT - 1);
@@ -37,29 +36,10 @@ constexpr uint64_t AlignReadbackCopySize(uint64_t size) noexcept {
 	return (size + READBACK_COPY_ALIGNMENT - 1) & ~(READBACK_COPY_ALIGNMENT - 1);
 }
 
-constexpr bool ShouldLogCommandProcessorReadback(uint64_t serial) noexcept {
-	return serial <= 32 || (serial % 256) == 0;
-}
-
-struct CommandProcessorReadbackState {
-	BufferCache*                          cache       = nullptr;
-	PageFaultAccess                       access      = PageFaultAccess::Unknown;
-	uint64_t                              vaddr       = 0;
-	uint64_t                              size        = 0;
-	uint64_t                              page        = 0;
-	uint64_t                              serial      = 0;
-	uint64_t                              dirty_bytes = 0;
-	uint64_t                              packed_bytes = 0;
-	uint32_t                              dirty_count = 0;
-	std::chrono::steady_clock::time_point started {};
-	bool                                  installed = false;
-};
-
-thread_local CommandProcessorReadbackState g_command_processor_readback;
-std::atomic<uint64_t>                       g_command_processor_readback_serial {0};
-
 struct SharedVulkanBufferOwner {
-	explicit SharedVulkanBufferOwner(GraphicContext* context): ctx(context) { EXIT_IF(ctx == nullptr); }
+	explicit SharedVulkanBufferOwner(GraphicContext* context): ctx(context) {
+		EXIT_IF(ctx == nullptr);
+	}
 
 	~SharedVulkanBufferOwner() {
 		if (buffer.buffer != nullptr) {
@@ -68,7 +48,7 @@ struct SharedVulkanBufferOwner {
 	}
 
 	GraphicContext* ctx = nullptr;
-	VulkanBuffer   buffer;
+	VulkanBuffer    buffer;
 };
 
 std::shared_ptr<VulkanBuffer> MakeSharedVulkanBuffer(GraphicContext* ctx) {
@@ -190,24 +170,12 @@ bool CanMergeBufferCacheQueueMask(uint64_t queue_mask, uint32_t queue) noexcept 
 	return queue < 64 && (queue_mask & ~(uint64_t {1} << queue)) == 0;
 }
 
-bool CanReadbackBufferCacheQueueMask(uint64_t queue_mask, uint32_t queue) noexcept {
-	return queue < 64 && queue_mask == (uint64_t {1} << queue);
-}
-
 struct BufferCache::CachedBuffer {
 	uint64_t                      vaddr      = 0;
 	uint64_t                      size       = 0;
 	uint64_t                      queue_mask = 0;
 	GraphicContext*               ctx        = nullptr;
 	std::shared_ptr<VulkanBuffer> buffer;
-};
-
-struct BufferCache::CommandProcessorReadbackResources {
-	GraphicContext*                ctx    = nullptr;
-	int                            queue  = -1;
-	VulkanBuffer                   buffer {};
-	void*                          mapped = nullptr;
-	std::unique_ptr<CommandBuffer> command;
 };
 
 struct BufferCache::ReadbackWorker {
@@ -257,8 +225,8 @@ struct BufferCache::ReadbackWorker {
 		}
 		auto current = state.load(std::memory_order_acquire);
 		while (current == State::InitRequested ||
-		       (current == State::Claimed && (command == nullptr || mapped == nullptr ||
-		                                      readback.buffer == nullptr))) {
+		       (current == State::Claimed &&
+		        (command == nullptr || mapped == nullptr || readback.buffer == nullptr))) {
 			state.wait(current, std::memory_order_acquire);
 			current = state.load(std::memory_order_acquire);
 		}
@@ -303,21 +271,20 @@ struct BufferCache::ReadbackWorker {
 	}
 
 	void Request(PageFaultAccess fault_access, uint64_t fault_vaddr, uint64_t fault_size) noexcept {
-		const bool submissions_prepaused_now = GraphicsRunSubmissionLockHeld();
+		const bool command_thread            = GraphicsRunIsCommandProcessorThread();
+		const bool submissions_prepaused_now = GraphicsRunSubmissionLockHeld() || command_thread;
 		const bool unsafe_gpu_lock = GraphicsRunGpuLockHeld() && !submissions_prepaused_now;
-		if (GraphicsRunIsCommandProcessorThread() || unsafe_gpu_lock || LabelInCallback() ||
-		    g_cache_lock_owner != nullptr ||
+		if (unsafe_gpu_lock || LabelInCallback() || g_cache_lock_owner != nullptr ||
 		    ctx == nullptr || command == nullptr || mapped == nullptr ||
 		    readback.buffer == nullptr) {
 			EXIT("BufferCache: unsafe readback request context, command_thread=%d "
 			     "submission_lock=%d "
 			     "gpu_lock=%d label_callback=%d cache_lock=%p ctx=%p command=%p mapped=%p "
 			     "buffer=%p\n",
-			     GraphicsRunIsCommandProcessorThread(), GraphicsRunSubmissionLockHeld(),
-			     GraphicsRunGpuLockHeld(), LabelInCallback(),
-			     static_cast<const void*>(g_cache_lock_owner), static_cast<const void*>(ctx),
-			     static_cast<const void*>(command.get()), static_cast<const void*>(mapped),
-			     static_cast<const void*>(readback.buffer));
+			     command_thread, GraphicsRunSubmissionLockHeld(), GraphicsRunGpuLockHeld(),
+			     LabelInCallback(), static_cast<const void*>(g_cache_lock_owner),
+			     static_cast<const void*>(ctx), static_cast<const void*>(command.get()),
+			     static_cast<const void*>(mapped), static_cast<const void*>(readback.buffer));
 		}
 		State expected = State::Idle;
 		while (!state.compare_exchange_weak(expected, State::Claimed, std::memory_order_acq_rel)) {
@@ -328,10 +295,10 @@ struct BufferCache::ReadbackWorker {
 			state.wait(expected, std::memory_order_acquire);
 			expected = State::Idle;
 		}
-		access      = fault_access;
-		vaddr       = fault_vaddr;
-		size        = fault_size;
-		range_count = 0;
+		access                = fault_access;
+		vaddr                 = fault_vaddr;
+		size                  = fault_size;
+		range_count           = 0;
 		submissions_prepaused = submissions_prepaused_now;
 		state.store(State::Requested, std::memory_order_release);
 		state.notify_all();
@@ -368,7 +335,7 @@ struct BufferCache::ReadbackWorker {
 		for (uint32_t i = 0; i < range_count; i++) {
 			const auto& range = ranges[i];
 			Libs::LibKernel::Memory::WriteBacking(range.address, data.data() + range.offset,
-			                                       range.size);
+			                                      range.size);
 		}
 		if (!cache.m_memory_tracker.CompleteCpuFault(vaddr, size, access, true)) {
 			EXIT("BufferCache: failed to complete downloaded CPU fault, addr=0x%016" PRIx64
@@ -476,7 +443,7 @@ struct BufferCache::ReadbackWorker {
 			}
 			const auto         page = vaddr & ~(TRACKER_PAGE_SIZE - 1);
 			FaultSafeCacheLock lock(&cache, cache.m_mutex);
-			auto                      it = cache.m_buffers.upper_bound(vaddr);
+			auto               it = cache.m_buffers.upper_bound(vaddr);
 			if (it == cache.m_buffers.begin()) {
 				EXIT("BufferCache: readback address has no cached buffer, addr=0x%016" PRIx64 "\n",
 				     vaddr);
@@ -564,10 +531,10 @@ struct BufferCache::ReadbackWorker {
 	VulkanBuffer                           readback {};
 	void*                                  mapped = nullptr;
 	std::unique_ptr<CommandBuffer>         command;
-	PageFaultAccess                        access      = PageFaultAccess::Unknown;
-	uint64_t                               vaddr       = 0;
-	uint64_t                               size        = 0;
-	uint32_t                               range_count = 0;
+	PageFaultAccess                        access                = PageFaultAccess::Unknown;
+	uint64_t                               vaddr                 = 0;
+	uint64_t                               size                  = 0;
+	uint32_t                               range_count           = 0;
 	bool                                   submissions_prepaused = false;
 	std::array<Range, MAX_RANGES>          ranges {};
 	std::array<uint8_t, READBACK_CAPACITY> data {};
@@ -583,18 +550,6 @@ BufferCache::BufferCache(PageManager& page_manager, ResourceMutex& resource_mute
 
 BufferCache::~BufferCache() {
 	m_readback.reset();
-	if (m_cp_readback_resources != nullptr) {
-		auto& resources = *m_cp_readback_resources;
-		resources.command.reset();
-		if (resources.mapped != nullptr) {
-			VulkanUnmapMemory(resources.ctx, &resources.buffer.memory);
-			resources.mapped = nullptr;
-		}
-		if (resources.buffer.buffer != nullptr) {
-			VulkanDeleteBuffer(resources.ctx, &resources.buffer);
-		}
-		m_cp_readback_resources.reset();
-	}
 	if (!m_gpu_modified_ranges.Empty()) {
 		EXIT("BufferCache: destroyed with pending GPU-modified ranges\n");
 	}
@@ -622,14 +577,9 @@ bool BufferCache::InvalidateMemory(PageFaultAccess access, uint64_t vaddr, uint6
 	switch (phase) {
 		case PageFaultPhase::Invalidate: break;
 		case PageFaultPhase::Complete:
-			return CompleteCommandProcessorReadback(access, vaddr, size) ||
-			       m_readback->Complete(access, vaddr, size) ||
+			return m_readback->Complete(access, vaddr, size) ||
 			       m_memory_tracker.CompleteCpuFault(vaddr, size, access, false);
-		case PageFaultPhase::Release:
-			if (!ReleaseCommandProcessorReadback(access, vaddr, size)) {
-				m_readback->Release(access, vaddr, size);
-			}
-			return true;
+		case PageFaultPhase::Release: m_readback->Release(access, vaddr, size); return true;
 		default:
 			EXIT("BufferCache: unsupported page-fault phase %u\n", static_cast<uint32_t>(phase));
 	}
@@ -638,243 +588,9 @@ bool BufferCache::InvalidateMemory(PageFaultAccess access, uint64_t vaddr, uint6
 		return action == CpuFaultAction::Continue;
 	}
 	if (GraphicsRunIsCommandProcessorThread()) {
-		if (!GraphicsRunIsCommandProcessorGuestAccess()) {
-			EXIT("BufferCache: command-processor fault outside a coherent guest-memory access, "
-			     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
-			     vaddr, size);
-		}
-		RequestCommandProcessorReadback(access, vaddr, size);
-	} else {
-		m_readback->Request(access, vaddr, size);
+		GraphicsRunFinishCommandProcessors();
 	}
-	return true;
-}
-
-void BufferCache::RequestCommandProcessorReadback(PageFaultAccess access, uint64_t vaddr,
-                                                  uint64_t size) {
-	if (!GraphicsRunIsCommandProcessorThread() || g_command_processor_readback.cache != nullptr) {
-		EXIT("BufferCache: invalid nested command-processor readback\n");
-	}
-	const auto serial =
-	    g_command_processor_readback_serial.fetch_add(1, std::memory_order_relaxed) + 1;
-	if (serial == 0) {
-		EXIT("BufferCache: command-processor readback serial overflow\n");
-	}
-	const bool log_detail = ShouldLogCommandProcessorReadback(serial);
-	if (log_detail) {
-		LOGF("BufferCache: command-processor readback request serial=%" PRIu64
-		     " addr=0x%016" PRIx64 " size=0x%016" PRIx64 " access=%u poll=%d\n",
-		     serial, vaddr, size, static_cast<uint32_t>(access), GraphicsRunIsGuestMemoryPoll());
-		Log::Flush();
-	}
-	const auto page  = vaddr & ~(TRACKER_PAGE_SIZE - 1);
-	const auto queue = static_cast<uint32_t>(GraphicsRunBeginCommandProcessorReadback());
-	if (log_detail) {
-		LOGF("BufferCache: command-processor queue synchronized serial=%" PRIu64
-		     " queue=%u page=0x%016" PRIx64 "\n",
-		     serial, queue, page);
-		Log::Flush();
-	}
-	if (g_cache_lock_owner != nullptr) {
-		EXIT("BufferCache: command-processor readback entered with a cache lock\n");
-	}
-	g_cache_lock_owner = this;
-	m_mutex.Lock();
-	if (log_detail) {
-		LOGF("BufferCache: command-processor cache locked serial=%" PRIu64
-		     " page=0x%016" PRIx64 "\n",
-		     serial, page);
-		Log::Flush();
-	}
-
-	auto it = m_buffers.upper_bound(vaddr);
-	if (it == m_buffers.begin()) {
-		EXIT("BufferCache: command-processor readback address has no cached buffer, "
-		     "addr=0x%016" PRIx64 "\n",
-		     vaddr);
-	}
-	--it;
-	auto& cached = *it->second;
-	if (vaddr < cached.vaddr || vaddr >= cached.vaddr + cached.size || page < cached.vaddr ||
-	    TRACKER_PAGE_SIZE > cached.size - (page - cached.vaddr) || cached.ctx == nullptr ||
-	    cached.buffer == nullptr || cached.buffer->buffer == nullptr) {
-		EXIT("BufferCache: invalid command-processor readback owner, fault=0x%016" PRIx64
-		     " page=0x%016" PRIx64 " buffer=0x%016" PRIx64 "+0x%016" PRIx64 "\n",
-		     vaddr, page, cached.vaddr, cached.size);
-	}
-	if (!CanReadbackBufferCacheQueueMask(cached.queue_mask, queue)) {
-		EXIT("BufferCache: command-processor readback cannot synchronize cross-queue ownership, "
-		     "addr=0x%016" PRIx64 " used_queues=0x%016" PRIx64 " current_queue=%u\n",
-		     vaddr, cached.queue_mask, queue);
-	}
-	const auto dirty = m_gpu_modified_ranges.Intersections(page, TRACKER_PAGE_SIZE);
-	if (dirty.empty()) {
-		EXIT("BufferCache: command-processor GPU-dirty page has no dirty byte ranges, "
-		     "page=0x%016" PRIx64 "\n",
-		     page);
-	}
-	ValidateDirtyPages(m_gpu_modified_ranges, page, TRACKER_PAGE_SIZE, "command-processor");
-	if (m_cp_readback_resources == nullptr) {
-		auto resources       = std::make_unique<CommandProcessorReadbackResources>();
-		resources->ctx       = cached.ctx;
-		resources->buffer.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-		resources->buffer.memory.property = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-		                                     VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
-		                                     VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
-		VulkanCreateBuffer(cached.ctx, READBACK_CAPACITY, &resources->buffer);
-		VulkanMapMemory(cached.ctx, &resources->buffer.memory, &resources->mapped);
-		m_cp_readback_resources = std::move(resources);
-	}
-	auto& resources = *m_cp_readback_resources;
-	if (resources.ctx != cached.ctx || resources.mapped == nullptr ||
-	    resources.buffer.buffer == nullptr) {
-		EXIT("BufferCache: invalid command-processor readback resources\n");
-	}
-	if (queue >= GraphicContext::QUEUES_NUM || cached.ctx->queues[queue].family == UINT32_MAX ||
-	    cached.ctx->queues[queue].vk_queue == nullptr) {
-		EXIT("BufferCache: command-processor readback has invalid Vulkan queue %u\n", queue);
-	}
-	if (resources.command == nullptr || resources.queue != static_cast<int>(queue)) {
-		resources.command.reset();
-		resources.command = std::make_unique<CommandBuffer>(static_cast<int>(queue));
-		resources.queue   = static_cast<int>(queue);
-	}
-	if (resources.command->IsInvalid() || resources.command->GetQueue() != static_cast<int>(queue)) {
-		EXIT("BufferCache: failed to initialize owning-queue readback command buffer, queue=%u\n",
-		     queue);
-	}
-	if (dirty.size() > ReadbackWorker::MAX_RANGES) {
-		EXIT("BufferCache: too many command-processor dirty ranges, page=0x%016" PRIx64
-		     " count=%" PRIu64 " limit=%u\n",
-		     page, static_cast<uint64_t>(dirty.size()), ReadbackWorker::MAX_RANGES);
-	}
-	std::array<VkBufferCopy, ReadbackWorker::MAX_RANGES>          copies {};
-	std::array<VkBufferMemoryBarrier, ReadbackWorker::MAX_RANGES> barriers {};
-	uint64_t                                                       dirty_bytes  = 0;
-	uint64_t                                                       packed_bytes = 0;
-	uint32_t                                                       dirty_count = 0;
-	for (const auto& range: dirty) {
-		if ((range.address - cached.vaddr) % 4 != 0 || range.size % 4 != 0) {
-			EXIT("BufferCache: invalid command-processor dirty range, addr=0x%016" PRIx64
-			     " size=0x%016" PRIx64 " page=0x%016" PRIx64 " packed=0x%016" PRIx64 "\n",
-			     range.address, range.size, page, dirty_bytes);
-		}
-		copies[dirty_count] = {.srcOffset = range.address - cached.vaddr,
-		                       .dstOffset = packed_bytes,
-		                       .size      = range.size};
-		auto& barrier               = barriers[dirty_count];
-		barrier.sType               = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-		barrier.srcAccessMask       = VK_ACCESS_MEMORY_WRITE_BIT;
-		barrier.dstAccessMask       = VK_ACCESS_TRANSFER_READ_BIT;
-		barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		barrier.buffer              = cached.buffer->buffer;
-		barrier.offset              = copies[dirty_count].srcOffset;
-		barrier.size                = range.size;
-		const auto slot_size = AlignReadbackCopySize(range.size);
-		if (packed_bytes > READBACK_CAPACITY || slot_size > READBACK_CAPACITY - packed_bytes) {
-			EXIT("BufferCache: aligned command-processor readback exceeds persistent capacity, "
-			     "packed=%" PRIu64 " size=%" PRIu64 " capacity=%" PRIu64 "\n",
-			     packed_bytes, slot_size, READBACK_CAPACITY);
-		}
-		packed_bytes += slot_size;
-		dirty_bytes += range.size;
-		dirty_count++;
-	}
-	if (dirty_count == 0 || dirty_bytes == 0) {
-		EXIT("BufferCache: command-processor readback produced no packed ranges\n");
-	}
-	const auto started = std::chrono::steady_clock::now();
-	if (log_detail) {
-		LOGF("BufferCache: command-processor readback begin serial=%" PRIu64
-		     " queue=%u page=0x%016" PRIx64 " ranges=%u bytes=%" PRIu64
-		     " packed=%" PRIu64 "\n",
-		     serial, queue, page, dirty_count, dirty_bytes, packed_bytes);
-		Log::Flush();
-	}
-	auto* vk_command = resources.command->GetPool()->buffers[resources.command->GetIndex()];
-	resources.command->Begin();
-	vkCmdPipelineBarrier(vk_command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-	                     VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, dirty_count,
-	                     barriers.data(), 0, nullptr);
-	vkCmdCopyBuffer(vk_command, cached.buffer->buffer, resources.buffer.buffer, dirty_count,
-	                copies.data());
-	resources.command->End();
-	resources.command->Execute();
-	resources.command->WaitForFenceAndReset();
-	if (log_detail) {
-		LOGF("BufferCache: command-processor GPU copy complete serial=%" PRIu64 "\n", serial);
-		Log::Flush();
-	}
-	for (uint32_t i = 0; i < dirty_count; i++) {
-		Libs::LibKernel::Memory::WriteBacking(
-		    dirty[i].address,
-		    static_cast<const uint8_t*>(resources.mapped) + copies[i].dstOffset, dirty[i].size);
-	}
-	g_command_processor_readback = {
-	    .cache       = this,
-	    .access      = access,
-	    .vaddr       = vaddr,
-	    .size        = size,
-	    .page        = page,
-	    .serial      = serial,
-	    .dirty_bytes = dirty_bytes,
-	    .packed_bytes = packed_bytes,
-	    .dirty_count = dirty_count,
-	    .started     = started};
-}
-
-bool BufferCache::CompleteCommandProcessorReadback(PageFaultAccess access, uint64_t vaddr,
-                                                   uint64_t size) noexcept {
-	auto& pending = g_command_processor_readback;
-	if (pending.cache == nullptr) {
-		return false;
-	}
-	if (pending.cache != this || pending.access != access || pending.vaddr != vaddr ||
-	    pending.size != size || pending.installed) {
-		EXIT("BufferCache: mismatched active command-processor readback completion\n");
-	}
-	if (!m_memory_tracker.CompleteCpuFault(vaddr, size, access, true)) {
-		EXIT("BufferCache: failed to complete command-processor readback, addr=0x%016" PRIx64
-		     " size=0x%016" PRIx64 " access=%u\n",
-		     vaddr, size, static_cast<uint32_t>(access));
-	}
-	m_gpu_modified_ranges.Subtract(pending.page, TRACKER_PAGE_SIZE);
-	pending.installed = true;
-	if (ShouldLogCommandProcessorReadback(pending.serial)) {
-		LOGF("BufferCache: command-processor readback complete serial=%" PRIu64
-		     " page=0x%016" PRIx64 " ranges=%u bytes=%" PRIu64 "\n",
-		     pending.serial, pending.page, pending.dirty_count, pending.dirty_bytes);
-	}
-	return true;
-}
-
-bool BufferCache::ReleaseCommandProcessorReadback(PageFaultAccess access, uint64_t vaddr,
-                                                  uint64_t size) noexcept {
-	auto& pending = g_command_processor_readback;
-	if (pending.cache == nullptr) {
-		return false;
-	}
-	if (pending.cache != this || pending.access != access || pending.vaddr != vaddr ||
-	    pending.size != size || !pending.installed) {
-		EXIT("BufferCache: mismatched active command-processor readback release\n");
-	}
-	const auto serial        = pending.serial;
-	const auto page          = pending.page;
-	const auto dirty_count   = pending.dirty_count;
-	const auto dirty_bytes   = pending.dirty_bytes;
-	const auto elapsed_micro = std::chrono::duration_cast<std::chrono::microseconds>(
-	                               std::chrono::steady_clock::now() - pending.started)
-	                               .count();
-	pending = {};
-	m_mutex.Unlock();
-	g_cache_lock_owner = nullptr;
-	GraphicsRunEndCommandProcessorReadback();
-	if (ShouldLogCommandProcessorReadback(serial)) {
-		LOGF("BufferCache: command-processor readback release serial=%" PRIu64
-		     " page=0x%016" PRIx64 " ranges=%u bytes=%" PRIu64 " elapsed_us=%" PRIi64 "\n",
-		     serial, page, dirty_count, dirty_bytes, static_cast<int64_t>(elapsed_micro));
-	}
+	m_readback->Request(access, vaddr, size);
 	return true;
 }
 
@@ -960,48 +676,50 @@ std::pair<VulkanBuffer*, uint64_t> BufferCache::ObtainBuffer(CommandBuffer*  com
 	const auto      begin = AlignDown(vaddr);
 	const auto      end   = AlignUp(vaddr + size);
 	std::lock_guard transaction(m_resource_mutex);
+	const auto      texture_region = m_texture_cache->QueryRegion(vaddr, size);
 	// Use the stream-buffer fast path before image/buffer alias handling. Clean image and metadata
 	// views may coexist with a small CPU-current read; Kyty's separate image trackers require
 	// GPU-dirty ownership guards here. Read physical backing so
 	// host page protection is irrelevant.
 	if (is_read && !is_written && size <= CACHING_PAGE_SIZE &&
 	    !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
-	    m_memory_tracker.IsRegionCpuModified(vaddr, size) &&
-	    !m_texture_cache->HasGpuModifiedRangeOverlap(vaddr, size) &&
-	    !m_texture_cache->IsMetaGpuModified(vaddr, size)) {
+	    m_memory_tracker.IsRegionCpuModified(vaddr, size) && !texture_region.gpu_image_bytes &&
+	    !texture_region.gpu_metadata_bytes) {
 		std::array<uint8_t, CACHING_PAGE_SIZE> guest_data;
 		if (Libs::LibKernel::Memory::TryReadBacking(vaddr, guest_data.data(), size)) {
-			VulkanBuffer* stream_buffer = nullptr;
-			VkDeviceSize  stream_offset = 0;
-			VkDeviceSize  stream_range  = 0;
-			const auto stream_alignment = std::max<uint64_t>(ctx->StorageMinAlignment(), 16);
+			VulkanBuffer* stream_buffer    = nullptr;
+			VkDeviceSize  stream_offset    = 0;
+			VkDeviceSize  stream_range     = 0;
+			const auto    stream_alignment = std::max<uint64_t>(ctx->StorageMinAlignment(), 16);
 			if (UploadHostData(command, ctx, guest_data.data(), size, stream_alignment,
 			                   &stream_buffer, &stream_offset, &stream_range)) {
 				return {stream_buffer, stream_offset};
 			}
 		}
 	}
-	if (m_texture_cache->HasMetaOverlap(begin, end - begin)) {
+	const auto texture_pages = begin == vaddr && end - begin == size
+	                               ? texture_region
+	                               : m_texture_cache->QueryRegion(begin, end - begin);
+	if (texture_pages.metadata_pages) {
 		EXIT("BufferCache: buffer aliases metadata pages, addr=0x%016" PRIx64 " size=0x%016" PRIx64
 		     "\n",
 		     begin, end - begin);
 	}
 	// Cache allocations are tracker-page aligned, but byte-disjoint buffers and images may share
 	// an edge page. Clean read-only buffer and image views may coexist; Kyty retains a hard failure
-	// when either cache owns newer GPU bytes. Only a formatted buffer write
-	// performs the image ownership transition below.
-	if (m_texture_cache->HasPageOverlap(begin, end - begin) &&
-	    m_texture_cache->HasRangeOverlap(vaddr, size)) {
-		const bool coherent_read =
-		    is_read && !is_written && !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
-		    !m_texture_cache->HasGpuModifiedRangeOverlap(vaddr, size);
+	// when either cache owns newer GPU bytes. Writable buffers delegate the ownership transition
+	// to TextureCache, which distinguishes raw texture-data writes from formatted target paths.
+	if (texture_pages.image_pages && texture_region.image_bytes) {
+		const bool coherent_read = is_read && !is_written &&
+		                           !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
+		                           !texture_region.gpu_image_bytes;
 		if (!coherent_read) {
-			if (!is_written || !is_formatted) {
+			if (!is_written) {
 				EXIT("BufferCache: unsupported buffer/image alias, addr=0x%016" PRIx64
 				     " size=0x%016" PRIx64 " read=%d written=%d formatted=%d\n",
 				     vaddr, size, is_read, is_written, is_formatted);
 			}
-			m_texture_cache->InvalidateMemoryFromGPU(vaddr, size, true);
+			(void)m_texture_cache->InvalidateMemoryFromGPU(vaddr, size, is_formatted);
 		}
 	}
 	if (is_written) {
@@ -1041,7 +759,7 @@ std::pair<VulkanBuffer*, uint64_t> BufferCache::ObtainBuffer(CommandBuffer*  com
 		}
 
 		if (!overlaps.empty()) {
-			for (const auto overlap: overlaps) {
+			for (const auto& overlap: overlaps) {
 				auto& old = *overlap->second;
 				if (old.ctx != ctx || old.buffer == nullptr || old.buffer->buffer == nullptr) {
 					EXIT("BufferCache: invalid overlapping buffer owner, addr=0x%016" PRIx64
@@ -1071,10 +789,10 @@ std::pair<VulkanBuffer*, uint64_t> BufferCache::ObtainBuffer(CommandBuffer*  com
 				    });
 			}
 		}
-		auto cached   = std::make_unique<CachedBuffer>();
-		cached->vaddr = merged.address;
-		cached->size  = merged.size;
-		cached->ctx   = ctx;
+		auto cached    = std::make_unique<CachedBuffer>();
+		cached->vaddr  = merged.address;
+		cached->size   = merged.size;
+		cached->ctx    = ctx;
 		cached->buffer = MakeSharedVulkanBuffer(ctx);
 		cached->buffer->usage =
 		    VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
@@ -1086,7 +804,7 @@ std::pair<VulkanBuffer*, uint64_t> BufferCache::ObtainBuffer(CommandBuffer*  com
 			auto* vk_buffer = command->GetPool()->buffers[command->GetIndex()];
 			std::vector<VkBufferMemoryBarrier> before;
 			before.reserve(overlaps.size() + 1);
-			for (const auto overlap: overlaps) {
+			for (const auto& overlap: overlaps) {
 				VkBufferMemoryBarrier barrier {};
 				barrier.sType               = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
 				barrier.srcAccessMask       = VK_ACCESS_MEMORY_WRITE_BIT;
@@ -1111,7 +829,7 @@ std::pair<VulkanBuffer*, uint64_t> BufferCache::ObtainBuffer(CommandBuffer*  com
 			                     VK_PIPELINE_STAGE_TRANSFER_BIT, VK_DEPENDENCY_BY_REGION_BIT, 0,
 			                     nullptr, static_cast<uint32_t>(before.size()), before.data(), 0,
 			                     nullptr);
-			for (const auto overlap: overlaps) {
+			for (const auto& overlap: overlaps) {
 				const auto&        old = *overlap->second;
 				const VkBufferCopy copy {
 				    .srcOffset = 0, .dstOffset = old.vaddr - cached->vaddr, .size = old.size};
@@ -1129,7 +847,7 @@ std::pair<VulkanBuffer*, uint64_t> BufferCache::ObtainBuffer(CommandBuffer*  com
 			vkCmdPipelineBarrier(vk_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
 			                     VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_DEPENDENCY_BY_REGION_BIT, 0,
 			                     nullptr, 1, &after, 0, nullptr);
-			for (const auto overlap: overlaps) {
+			for (const auto& overlap: overlaps) {
 				command->RetainResourceUntilFence(overlap->second->buffer);
 				m_buffers.erase(overlap);
 			}
@@ -1166,7 +884,8 @@ bool BufferCache::UploadHostData(CommandBuffer* command, GraphicContext* ctx, co
 	if (command == nullptr || command->IsInvalid() || command->IsExecute() || ctx == nullptr) {
 		EXIT("BufferCache: host stream upload requires a recording command buffer\n");
 	}
-	return command->m_host_stream.Copy(ctx, src, size, alignment, out_buffer, out_offset, out_range);
+	return command->m_host_stream.Copy(ctx, src, size, alignment, out_buffer, out_offset,
+	                                   out_range);
 }
 
 VulkanBuffer* BufferCache::ObtainNullBuffer(CommandBuffer* command, GraphicContext* ctx) {
@@ -1177,7 +896,7 @@ VulkanBuffer* BufferCache::ObtainNullBuffer(CommandBuffer* command, GraphicConte
 	if (m_null_buffer == nullptr) {
 		// robustBufferAccess makes every fetch safe; TODO: Use a
 		// persistent 16-byte fallback when Vulkan null vertex descriptors are unavailable.
-		auto buffer = MakeSharedVulkanBuffer(ctx);
+		auto buffer   = MakeSharedVulkanBuffer(ctx);
 		buffer->usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
 		                VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
 		buffer->memory.property = static_cast<uint32_t>(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) |
@@ -1207,57 +926,28 @@ BufferImageCopySource BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t
 		     (vaddr & (TRACKER_PAGE_SIZE - 1)) == 0 && (size & (TRACKER_PAGE_SIZE - 1)) == 0);
 	}
 	FaultSafeCacheLock lock(this, m_mutex);
-	const bool         cpu_dirty = m_memory_tracker.IsRegionCpuModified(vaddr, size);
-	auto use_coherent_guest_backing = [&](const CachedBuffer& overlap) {
-		const bool gpu_modified = m_memory_tracker.IsRegionGpuModified(vaddr, size);
-		const auto dirty_ranges = m_gpu_modified_ranges.Intersections(vaddr, size);
-		if (gpu_modified || !dirty_ranges.empty()) {
-			EXIT("BufferCache: GPU-modified image source requires a containing cached buffer, "
-			     "addr=0x%016" PRIx64 " size=0x%016" PRIx64
-			     " buffer=0x%016" PRIx64 "+0x%016" PRIx64 " tracker_dirty=%d byte_ranges=%zu\n",
-			     vaddr, size, overlap.vaddr, overlap.size, gpu_modified, dirty_ranges.size());
+	const bool         cpu_modified = m_memory_tracker.IsRegionCpuModified(vaddr, size);
+	const bool         gpu_modified = m_memory_tracker.IsRegionGpuModified(vaddr, size);
+	const auto         dirty_ranges = m_gpu_modified_ranges.Intersections(vaddr, size);
+	if (gpu_modified != !dirty_ranges.empty()) {
+		EXIT("BufferCache: image-source tracker and byte ownership disagree, addr=0x%016" PRIx64
+		     " size=0x%016" PRIx64 " tracker_dirty=%d byte_ranges=%zu\n",
+		     vaddr, size, gpu_modified, dirty_ranges.size());
+	}
+	auto find_owner = [&](uint64_t address, uint64_t bytes) noexcept -> CachedBuffer& {
+		auto owner = m_buffers.upper_bound(address);
+		if (owner == m_buffers.begin()) {
+			EXIT("BufferCache: GPU image-source bytes have no cached owner\n");
 		}
-		// A clean/CPU-current image range may coexist with a partial cached-buffer view because
-		// guest backing is authoritative. The PS5 detiler consumes that backing at the existing
-		// Tiler seam.
-		return BufferImageCopySource {nullptr, 0, vaddr, size, true, cpu_dirty};
+		--owner;
+		auto&      cached = *owner->second;
+		const auto offset = address - cached.vaddr;
+		if (offset > cached.size || bytes > cached.size - offset || cached.ctx == nullptr ||
+		    cached.buffer == nullptr || cached.buffer->buffer == nullptr) {
+			EXIT("BufferCache: GPU image-source bytes have no containing native buffer\n");
+		}
+		return cached;
 	};
-	auto               it = m_buffers.upper_bound(vaddr);
-	if (it == m_buffers.begin()) {
-		if (it != m_buffers.end() &&
-		    PageOverlaps(vaddr, size, it->second->vaddr, it->second->size)) {
-			return use_coherent_guest_backing(*it->second);
-		}
-		return {nullptr, 0, vaddr, size, true, cpu_dirty};
-	}
-	--it;
-	auto&      cached = *it->second;
-	const auto offset = vaddr - cached.vaddr;
-	if (offset > cached.size || size > cached.size - offset) {
-		const auto next = std::next(it);
-		if (PageOverlaps(vaddr, size, cached.vaddr, cached.size)) {
-			return use_coherent_guest_backing(cached);
-		}
-		if (next != m_buffers.end() &&
-		    PageOverlaps(vaddr, size, next->second->vaddr, next->second->size)) {
-			return use_coherent_guest_backing(*next->second);
-		}
-		return {nullptr, 0, vaddr, size, true, cpu_dirty};
-	}
-	if (cached.ctx == nullptr || cached.buffer == nullptr || cached.buffer->buffer == nullptr) {
-		EXIT("BufferCache: inconsistent image source, addr=0x%016" PRIx64 " size=0x%016" PRIx64
-		     " buffer=0x%016" PRIx64 "+0x%016" PRIx64 " ctx=%p native=%p\n",
-		     vaddr, size, cached.vaddr, cached.size, static_cast<const void*>(cached.ctx),
-		     static_cast<const void*>(cached.buffer.get()));
-	}
-	const bool gpu_modified = m_memory_tracker.IsRegionGpuModified(vaddr, size);
-	const bool cpu_modified = cpu_dirty;
-	if (gpu_modified && cpu_modified) {
-		EXIT("BufferCache: image source is both CPU- and GPU-modified, addr=0x%016" PRIx64
-		     " size=0x%016" PRIx64 "\n",
-		     vaddr, size);
-	}
-	const auto ranges = m_gpu_modified_ranges.Intersections(vaddr, size);
 	if (gpu_modified) {
 		if (!GraphicsRunIsCommandProcessorThread() && !GraphicsRunSubmissionLockHeld() &&
 		    !LabelInCallback()) {
@@ -1267,13 +957,15 @@ BufferImageCopySource BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t
 			     vaddr, size, GraphicsRunIsCommandProcessorThread(),
 			     GraphicsRunSubmissionLockHeld(), LabelInCallback());
 		}
-		if (ranges.empty()) {
-			EXIT("BufferCache: GPU-dirty image read has no dirty byte ranges, addr=0x%016" PRIx64
-			     " size=0x%016" PRIx64 "\n",
-			     vaddr, size);
+		std::vector<GraphicContext*> waited;
+		for (const auto& range: dirty_ranges) {
+			auto& owner = find_owner(range.address, range.size);
+			if (std::find(waited.begin(), waited.end(), owner.ctx) == waited.end()) {
+				VulkanDeviceWaitIdle(owner.ctx);
+				waited.push_back(owner.ctx);
+			}
 		}
-		VulkanDeviceWaitIdle(cached.ctx);
-		auto     backing_writes = ReserveBackingWrites(m_page_manager, ranges);
+		auto     backing_writes = ReserveBackingWrites(m_page_manager, dirty_ranges);
 		uint64_t downloaded     = 0;
 		m_memory_tracker.ForEachDownloadRange<true>(
 		    vaddr, size,
@@ -1288,9 +980,10 @@ BufferImageCopySource BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t
 				         address, bytes);
 			    }
 			    for (const auto& range: dirty) {
-				    const auto buffer_offset = range.address - cached.vaddr;
+				    auto&                owner         = find_owner(range.address, range.size);
+				    const auto           buffer_offset = range.address - owner.vaddr;
 				    std::vector<uint8_t> data(range.size);
-				    UtilDownloadBuffer(cached.ctx, cached.buffer.get(), buffer_offset, data.data(),
+				    UtilDownloadBuffer(owner.ctx, owner.buffer.get(), buffer_offset, data.data(),
 				                       range.size);
 				    Libs::LibKernel::Memory::WriteBacking(range.address, data.data(), data.size());
 				    downloaded += range.size;
@@ -1302,10 +995,19 @@ BufferImageCopySource BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t
 			     vaddr, size);
 		}
 		m_gpu_modified_ranges.Subtract(vaddr, size);
-	} else if (!ranges.empty()) {
-		EXIT("BufferCache: CPU-current image source retains GPU-dirty bytes, addr=0x%016" PRIx64
-		     " size=0x%016" PRIx64 "\n",
-		     vaddr, size);
+	}
+	auto owner = m_buffers.upper_bound(vaddr);
+	if (owner == m_buffers.begin()) {
+		return {nullptr, 0, vaddr, size, true, cpu_modified};
+	}
+	--owner;
+	auto&      cached = *owner->second;
+	const auto offset = vaddr - cached.vaddr;
+	if (offset > cached.size || size > cached.size - offset) {
+		return {nullptr, 0, vaddr, size, true, cpu_modified};
+	}
+	if (cached.ctx == nullptr || cached.buffer == nullptr || cached.buffer->buffer == nullptr) {
+		EXIT("BufferCache: containing image source is inconsistent\n");
 	}
 	if (cpu_modified) {
 		std::vector<std::pair<uint64_t, uint64_t>> uploads;
@@ -1334,7 +1036,7 @@ BufferImageCopySource BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t
 		     " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
-	return {cached.buffer.get(), offset, vaddr, size, true, cpu_dirty};
+	return {cached.buffer.get(), offset, vaddr, size, true, cpu_modified};
 }
 
 namespace {
@@ -1384,7 +1086,8 @@ void BufferCache::FillBuffer(CommandBuffer* command, GraphicContext* ctx, uint64
 	ValidateGpuAccess(vaddr, size, false, true);
 	{
 		std::lock_guard transaction(m_resource_mutex);
-		const bool      image_overlap       = m_texture_cache->HasPageOverlap(vaddr, size);
+		const auto      texture_region      = m_texture_cache->QueryRegion(vaddr, size);
+		const bool      image_overlap       = texture_region.image_bytes;
 		const bool      buffer_overlap      = HasPageOverlap(vaddr, size);
 		const bool      buffer_gpu_modified = IsRegionGpuModified(vaddr, size);
 		if (!buffer_overlap && !buffer_gpu_modified) {
@@ -1400,7 +1103,7 @@ void BufferCache::FillBuffer(CommandBuffer* command, GraphicContext* ctx, uint64
 			     " size=0x%016" PRIx64 "\n",
 			     vaddr, size);
 		}
-		if (m_texture_cache->HasMetaOverlap(vaddr, size)) {
+		if (texture_region.metadata_bytes) {
 			LOGF("BufferCache: GPU fill overlaps virtual metadata, addr=0x%016" PRIx64
 			     " size=0x%016" PRIx64 "\n",
 			     vaddr, size);
@@ -1437,18 +1140,21 @@ void BufferCache::CopyBuffer(CommandBuffer* command, GraphicContext* ctx, uint64
 	}
 	ValidateGpuAccess(src_vaddr, size, true, false);
 	ValidateGpuAccess(dst_vaddr, size, false, true);
+	bool dst_image_transition = false;
 	{
 		std::lock_guard transaction(m_resource_mutex);
-		const bool      src_image = m_texture_cache->HasPageOverlap(src_vaddr, size);
-		const bool      dst_image = m_texture_cache->HasPageOverlap(dst_vaddr, size);
-		if (m_texture_cache->HasGpuTargetPageOverlap(src_vaddr, size)) {
+		const auto      src_region    = m_texture_cache->QueryRegion(src_vaddr, size);
+		const auto      dst_region    = m_texture_cache->QueryRegion(dst_vaddr, size);
+		const bool      src_image_gpu = src_region.gpu_image_bytes;
+		const bool      src_meta      = src_region.metadata_bytes;
+		if (src_region.non_sampled_pages) {
 			EXIT("BufferCache: GPU copy aliases target pages, src=0x%016" PRIx64
 			     " dst=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 			     src_vaddr, dst_vaddr, size);
 		}
 		if (!HasPageOverlap(dst_vaddr, size) && !IsRegionGpuModified(src_vaddr, size) &&
-		    !IsRegionGpuModified(dst_vaddr, size)) {
-			if (m_texture_cache->IsMetaGpuModified(src_vaddr, size)) {
+		    !IsRegionGpuModified(dst_vaddr, size) && !src_image_gpu) {
+			if (src_region.gpu_metadata_bytes) {
 				LOGF("BufferCache: host copy reads virtual metadata, src=0x%016" PRIx64
 				     " size=0x%016" PRIx64 "\n",
 				     src_vaddr, size);
@@ -1456,27 +1162,28 @@ void BufferCache::CopyBuffer(CommandBuffer* command, GraphicContext* ctx, uint64
 				     "src=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 				     src_vaddr, size);
 			}
-			if (dst_image) {
+			if (dst_region.image_bytes) {
 				m_texture_cache->PrepareHostWrite(dst_vaddr, size);
 			}
 			std::memcpy(reinterpret_cast<void*>(dst_vaddr),
 			            reinterpret_cast<const void*>(src_vaddr), size);
 			return;
 		}
+		if (src_image_gpu) {
+			EXIT("BufferCache: GPU copy source aliases GPU-modified image, src=0x%016" PRIx64
+			     " dst=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+			     src_vaddr, dst_vaddr, size);
+		}
+		dst_image_transition        = m_texture_cache->InvalidateMemoryFromGPU(dst_vaddr, size);
+		const auto transitioned_dst = m_texture_cache->QueryRegion(dst_vaddr, size);
 		// A clean target destination is handled above like a protected host write. Target
 		// aliases that require an actual GPU buffer copy remain unsupported.
-		if (m_texture_cache->HasGpuTargetPageOverlap(dst_vaddr, size)) {
+		if (transitioned_dst.non_sampled_pages) {
 			EXIT("BufferCache: GPU copy aliases target pages, src=0x%016" PRIx64
 			     " dst=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 			     src_vaddr, dst_vaddr, size);
 		}
-		if (src_image || dst_image) {
-			EXIT("BufferCache: GPU copy requires image-buffer synchronization, src=0x%016" PRIx64
-			     " dst=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
-			     src_vaddr, dst_vaddr, size);
-		}
-		if (m_texture_cache->HasMetaOverlap(src_vaddr, size) ||
-		    m_texture_cache->HasMetaOverlap(dst_vaddr, size)) {
+		if (src_meta || transitioned_dst.metadata_bytes) {
 			LOGF("BufferCache: GPU copy overlaps virtual metadata, src=0x%016" PRIx64
 			     " dst=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 			     src_vaddr, dst_vaddr, size);
@@ -1486,7 +1193,8 @@ void BufferCache::CopyBuffer(CommandBuffer* command, GraphicContext* ctx, uint64
 		}
 	}
 	const auto [src, src_offset] = ObtainBuffer(command, ctx, src_vaddr, size, false, true);
-	const auto [dst, dst_offset] = ObtainBuffer(command, ctx, dst_vaddr, size, true, false);
+	const auto [dst, dst_offset] =
+	    ObtainBuffer(command, ctx, dst_vaddr, size, true, false, dst_image_transition);
 	if (src == dst && src_offset < dst_offset + size && dst_offset < src_offset + size) {
 		EXIT("BufferCache: resolved Vulkan copy ranges overlap, src_offset=0x%016" PRIx64
 		     " dst_offset=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
@@ -1541,12 +1249,6 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 }
 
 void BufferCache::PublishImageBacking(uint64_t vaddr, uint64_t size) {
-	if (vaddr == 0 || size == 0 || vaddr >= TRACKER_ADDRESS_SIZE ||
-	    size > TRACKER_ADDRESS_SIZE - vaddr) {
-		EXIT("BufferCache: invalid image-backing publication, addr=0x%016" PRIx64
-		     " size=0x%016" PRIx64 "\n",
-		     vaddr, size);
-	}
 	FaultSafeCacheLock lock(this, m_mutex);
 	auto               owner = m_buffers.end();
 	for (auto it = m_buffers.begin(); it != m_buffers.end(); ++it) {
@@ -1563,10 +1265,7 @@ void BufferCache::PublishImageBacking(uint64_t vaddr, uint64_t size) {
 		}
 		owner = it;
 	}
-	if ((owner != m_buffers.end() &&
-	     (owner->second->ctx == nullptr || owner->second->buffer == nullptr ||
-	      owner->second->buffer->buffer == nullptr ||
-	      m_memory_tracker.IsRegionCpuModified(vaddr, size))) ||
+	if ((owner != m_buffers.end() && m_memory_tracker.IsRegionCpuModified(vaddr, size)) ||
 	    m_memory_tracker.IsRegionGpuModified(vaddr, size) ||
 	    !m_gpu_modified_ranges.Intersections(vaddr, size).empty()) {
 		EXIT("BufferCache: image backing requires clean buffer ownership, addr=0x%016" PRIx64
@@ -1606,7 +1305,7 @@ void BufferCache::SetTextureCache(TextureCache& texture_cache) {
 	m_texture_cache = &texture_cache;
 }
 
-//TODO: add LRU cache
+// TODO: add LRU cache
 void BufferCache::RegisterForDelete(VulkanBuffer* buffer) {
 	FaultSafeCacheLock lock(this, m_mutex);
 

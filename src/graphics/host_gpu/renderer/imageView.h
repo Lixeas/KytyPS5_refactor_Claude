@@ -3,19 +3,27 @@
 
 #include "common/assert.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/imageInfo.h"
 #include "graphics/shader/recompiler/ShaderIR.h"
 #include "graphics/shader/shader.h"
 
 namespace Libs::Graphics {
 
 [[nodiscard]] inline bool IsSupportedStorageSwizzle(uint32_t format, uint32_t swizzle) noexcept {
-	const bool single_channel_uint = format == Prospero::GpuEnumValue(Prospero::BufferFormat::k8UInt) ||
-	                                 format == Prospero::GpuEnumValue(Prospero::BufferFormat::k16UInt) ||
-	                                 format == Prospero::GpuEnumValue(Prospero::BufferFormat::k32UInt);
+	const bool single_channel =
+	    format == Prospero::GpuEnumValue(Prospero::BufferFormat::k8UNorm) ||
+	    format == Prospero::GpuEnumValue(Prospero::BufferFormat::k8UInt) ||
+	    format == Prospero::GpuEnumValue(Prospero::BufferFormat::k16UInt) ||
+	    format == Prospero::GpuEnumValue(Prospero::BufferFormat::k32UInt) ||
+	    format == Prospero::GpuEnumValue(Prospero::BufferFormat::k16Float) ||
+	    format == Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float);
 	return swizzle == DstSel(4, 5, 6, 7) ||
-	       (single_channel_uint &&
-	        (swizzle == DstSel(4, 0, 0, 0) || swizzle == DstSel(4, 0, 0, 1))) ||
-	       (format == Prospero::GpuEnumValue(Prospero::BufferFormat::k8_8_8_8UNorm) &&
+	       (single_channel && (swizzle == DstSel(4, 0, 0, 0) || swizzle == DstSel(4, 0, 0, 1) ||
+	                           swizzle == DstSel(4, 4, 4, 4))) ||
+	       (format == Prospero::GpuEnumValue(Prospero::BufferFormat::k32_32UInt) &&
+	        swizzle == DstSel(4, 5, 0, 1)) ||
+	       ((format == Prospero::GpuEnumValue(Prospero::BufferFormat::k8_8_8_8UNorm) ||
+	         format == Prospero::GpuEnumValue(Prospero::BufferFormat::k8_8_8_8UInt)) &&
 	        (swizzle == DstSel(4, 5, 6, 1) || swizzle == DstSel(6, 5, 4, 7))) ||
 	       (format == Prospero::GpuEnumValue(Prospero::BufferFormat::k32_32_32_32Float) &&
 	        swizzle == DstSel(5, 6, 7, 4));
@@ -24,9 +32,12 @@ namespace Libs::Graphics {
 [[nodiscard]] inline bool IsSupportedStorageDepthTile(uint32_t format, uint32_t type,
                                                       uint32_t width, uint32_t height,
                                                       uint32_t depth) noexcept {
-	return format == Prospero::GpuEnumValue(Prospero::BufferFormat::k8UInt) &&
-	       type == Prospero::GpuEnumValue(Prospero::ImageType::kColor2DArray) && width == 1 &&
-	       height == 1 && depth == 1;
+	return (format == Prospero::GpuEnumValue(Prospero::BufferFormat::k8UInt) &&
+	        type == Prospero::GpuEnumValue(Prospero::ImageType::kColor2DArray) && width != 0 &&
+	        height != 0 && depth == 1) ||
+	       (format == Prospero::GpuEnumValue(Prospero::BufferFormat::k32UInt) &&
+	        type == Prospero::GpuEnumValue(Prospero::ImageType::kColor2D) && width != 0 &&
+	        height != 0 && depth == 1);
 }
 
 [[noreturn]] inline void UnsupportedColorView(const char* usage, VkFormat image_format,
@@ -64,41 +75,75 @@ namespace Libs::Graphics {
 	return image_format == VK_FORMAT_B8G8R8A8_SRGB ? VK_FORMAT_R8G8B8A8_UNORM : VK_FORMAT_UNDEFINED;
 }
 
+[[nodiscard]] inline VkFormat SrgbStorageViewFormat(VkFormat image_format) noexcept {
+	return image_format == VK_FORMAT_R8G8B8A8_SRGB ? VK_FORMAT_R8G8B8A8_UNORM
+	                                               : BgraSrgbStorageViewFormat(image_format);
+}
+
 [[nodiscard]] inline bool IsBgraSrgbStorageView(VkFormat image_format, VkFormat view_format,
                                                 uint32_t swizzle) noexcept {
 	return view_format == BgraSrgbStorageViewFormat(image_format) && swizzle == DstSel(6, 5, 4, 7);
 }
 
-[[nodiscard]] inline int SelectSampledColorView(VkFormat image_format, VkFormat view_format,
-                                                uint32_t swizzle) noexcept {
-	if (image_format == view_format) {
-		switch (swizzle) {
-			case DstSel(4, 5, 6, 7): return VulkanImage::VIEW_DEFAULT;
-			case DstSel(4, 0, 0, 1): return VulkanImage::VIEW_R001;
-			case DstSel(4, 5, 0, 1): return VulkanImage::VIEW_RG01;
-			case DstSel(4, 5, 6, 1): return VulkanImage::VIEW_RGB1;
-			default: break;
+[[nodiscard]] inline bool IsValidSampledColorSwizzle(uint32_t swizzle) noexcept {
+	if ((swizzle & ~0xfffu) != 0) {
+		return false;
+	}
+	for (uint32_t channel = 0; channel < 4; channel++) {
+		switch (GetDstSel(swizzle, channel)) {
+			case 0:
+			case 1:
+			case 4:
+			case 5:
+			case 6:
+			case 7: break;
+			default: return false;
 		}
 	}
-	if (IsBgraToRgbaSampledView(image_format, view_format) && swizzle == DstSel(6, 5, 4, 7)) {
-		return VulkanImage::VIEW_BGRA_TO_RGBA;
+	return true;
+}
+
+[[nodiscard]] inline bool IsSupportedSampledColorView(VkFormat image_format, VkFormat view_format,
+                                                      uint32_t swizzle) noexcept {
+	if (!IsValidSampledColorSwizzle(swizzle)) {
+		return false;
+	}
+	if (image_format == view_format || IsRgba8SrgbReinterpretation(image_format, view_format)) {
+		return true;
+	}
+	if ((IsRgba16UintFloatReinterpretation(image_format, view_format) ||
+	     IsRgba8UnormUintReinterpretation(image_format, view_format)) &&
+	    swizzle == DstSel(4, 5, 6, 7)) {
+		return true;
+	}
+	return IsBgraToRgbaSampledView(image_format, view_format) && swizzle == DstSel(6, 5, 4, 7);
+}
+
+[[nodiscard]] inline uint32_t SelectSampledColorView(VkFormat image_format, VkFormat view_format,
+                                                     uint32_t swizzle) noexcept {
+	if (IsSupportedSampledColorView(image_format, view_format, swizzle)) {
+		return swizzle;
 	}
 	UnsupportedColorView("sampled", image_format, view_format, swizzle);
 }
 
-[[nodiscard]] inline int SelectSampledDepthView(VkFormat image_format, VkFormat view_format,
-                                                uint32_t swizzle) noexcept {
-	const bool d16 = image_format == VK_FORMAT_D16_UNORM && view_format == VK_FORMAT_R16_UNORM;
-	const bool d32 =
-	    (image_format == VK_FORMAT_D32_SFLOAT || image_format == VK_FORMAT_D32_SFLOAT_S8_UINT) &&
-	    view_format == VK_FORMAT_R32_SFLOAT;
-	if (d16 || d32) {
-		switch (swizzle) {
-			case DstSel(4, 4, 4, 4): return VulkanImage::VIEW_DEPTH_TEXTURE;
-			case DstSel(4, 0, 0, 0): return VulkanImage::VIEW_R000;
-			case DstSel(4, 0, 0, 1): return VulkanImage::VIEW_R001;
-			default: break;
-		}
+[[nodiscard]] inline bool IsSupportedSampledDepthView(VkFormat image_format, VkFormat view_format,
+                                                      uint32_t swizzle) noexcept {
+	if (!IsSupportedSampledDepthFormat(image_format, view_format)) {
+		return false;
+	}
+	switch (swizzle) {
+		case DstSel(4, 4, 4, 4):
+		case DstSel(4, 0, 0, 0):
+		case DstSel(4, 0, 0, 1): return true;
+		default: return false;
+	}
+}
+
+[[nodiscard]] inline uint32_t SelectSampledDepthView(VkFormat image_format, VkFormat view_format,
+                                                     uint32_t swizzle) noexcept {
+	if (IsSupportedSampledDepthView(image_format, view_format, swizzle)) {
+		return swizzle;
 	}
 	EXIT("unsupported sampled depth image view: image_format=%d view_format=%d swizzle=0x%03x\n",
 	     static_cast<int>(image_format), static_cast<int>(view_format), swizzle);
@@ -107,20 +152,32 @@ namespace Libs::Graphics {
 [[nodiscard]] inline bool
 IsSupportedSampledDepthResource(const ShaderRecompiler::IR::ImageResource& resource) noexcept {
 	return resource.kind == ShaderRecompiler::IR::ResourceKind::Image &&
-	       resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2D &&
+	       (resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2D ||
+	        resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DArray) &&
 	       resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::None && resource.read &&
 	       !resource.written && !resource.atomic;
 }
 
+[[nodiscard]] inline bool
+IsSupportedSampledDepthUintResource(const ShaderRecompiler::IR::ImageResource& resource) noexcept {
+	return resource.kind == ShaderRecompiler::IR::ResourceKind::ImageUint &&
+	       resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2D &&
+	       resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::None && resource.read &&
+	       !resource.written && !resource.atomic && !resource.depth_compare;
+}
+
 [[nodiscard]] inline int SelectStorageColorView(VkFormat image_format, VkFormat view_format,
                                                 uint32_t swizzle) noexcept {
-	const bool single_channel_uint = view_format == VK_FORMAT_R8_UINT ||
-	                                 view_format == VK_FORMAT_R16_UINT ||
-	                                 view_format == VK_FORMAT_R32_UINT;
+	const bool single_channel =
+	    view_format == VK_FORMAT_R8_UNORM || view_format == VK_FORMAT_R8_UINT ||
+	    view_format == VK_FORMAT_R16_UINT || view_format == VK_FORMAT_R32_UINT ||
+	    view_format == VK_FORMAT_R16_SFLOAT || view_format == VK_FORMAT_R32_SFLOAT;
 	const bool swizzle_ok =
 	    swizzle == DstSel(4, 5, 6, 7) ||
-	    (single_channel_uint && (swizzle == DstSel(4, 0, 0, 0) || swizzle == DstSel(4, 0, 0, 1))) ||
-	    (view_format == VK_FORMAT_R8G8B8A8_UNORM &&
+	    (single_channel && (swizzle == DstSel(4, 0, 0, 0) || swizzle == DstSel(4, 0, 0, 1) ||
+	                        swizzle == DstSel(4, 4, 4, 4))) ||
+	    (view_format == VK_FORMAT_R32G32_UINT && swizzle == DstSel(4, 5, 0, 1)) ||
+	    ((view_format == VK_FORMAT_R8G8B8A8_UNORM || view_format == VK_FORMAT_R8G8B8A8_UINT) &&
 	     (swizzle == DstSel(4, 5, 6, 1) || swizzle == DstSel(6, 5, 4, 7))) ||
 	    (view_format == VK_FORMAT_R32G32B32A32_SFLOAT && swizzle == DstSel(5, 6, 7, 4));
 	if ((image_format != view_format &&
@@ -152,6 +209,18 @@ ValidateStorageImageResource(const ShaderRecompiler::IR::ImageResource& resource
 		     resource.atomic, resource.depth_compare);
 	}
 }
+
+namespace ImageViewOps {
+
+[[nodiscard]] VkImageAspectFlags DepthAspectMask(VkFormat format) noexcept;
+[[nodiscard]] bool               FormatSupportsStorage(GraphicContext* ctx, VkFormat format);
+
+void CreateRenderTargetViews(GraphicContext* ctx, RenderTextureVulkanImage* image);
+void CreateDepthViews(GraphicContext* ctx, DepthStencilVulkanImage* image);
+void CreateVideoOutViews(GraphicContext* ctx, VideoOutVulkanImage* image);
+void DestroyViews(GraphicContext* ctx, VulkanImage* image);
+
+} // namespace ImageViewOps
 
 } // namespace Libs::Graphics
 

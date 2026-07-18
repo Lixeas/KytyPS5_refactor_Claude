@@ -141,7 +141,7 @@ config_compiler_and_linker()
 add_subdirectory("${KYTY_THIRD_PARTY_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/3rdparty")
 add_subdirectory(common)
 
-file(GLOB kyty_emulator_src
+file(GLOB kyty_emulator_src CONFIGURE_DEPENDS
 	libs/*.cpp
 	libs/*.h
 	graphics/*.cpp
@@ -345,6 +345,11 @@ target_link_libraries(resource_mutex_tests common)
 target_include_directories(resource_mutex_tests PRIVATE ${inc_headers})
 add_kyty_test(resource_mutex_tests)
 
+add_executable(image_page_table_tests EXCLUDE_FROM_ALL
+	../tests/ImagePageTableTests.cpp
+)
+target_include_directories(image_page_table_tests PRIVATE ${inc_headers})
+
 add_kyty_full_emulator_test(shader_recompiler_compute_tests ../tests/ShaderRecompilerComputeTests.cpp)
 # Needs a real Vulkan device: the harness creates an instance and dispatches a compute shader, so it
 # fails with VK_ERROR_INCOMPATIBLE_DRIVER on a machine without a GPU. Labelled so those environments
@@ -352,6 +357,8 @@ add_kyty_full_emulator_test(shader_recompiler_compute_tests ../tests/ShaderRecom
 set_tests_properties(shader_recompiler_compute_tests PROPERTIES LABELS gpu)
 
 add_kyty_full_emulator_test(virtual_memory_allocation_tests ../tests/VirtualMemoryAllocationTests.cpp)
+target_compile_definitions(virtual_memory_allocation_tests PRIVATE
+	KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS=1)
 
 
 add_executable(kyty_emulator main.cpp ${kyty_emulator_src})

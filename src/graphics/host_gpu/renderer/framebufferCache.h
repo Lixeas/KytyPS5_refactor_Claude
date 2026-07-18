@@ -6,12 +6,15 @@
 #include "common/common.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
-#include "graphics/host_gpu/renderer/renderState.h"
+#include "graphics/host_gpu/renderer/renderTarget.h"
 
 #include <vector>
 #include <vulkan/vulkan_core.h>
 
 namespace Libs::Graphics {
+
+struct RenderColorInfo;
+struct RenderDepthInfo;
 
 static constexpr VkImageLayout RENDER_COLOR_IMAGE_LAYOUT = VK_IMAGE_LAYOUT_GENERAL;
 
@@ -63,6 +66,7 @@ private:
 		uint64_t           image_id[RENDER_COLOR_ATTACHMENTS_MAX]           = {};
 		VkImageView        color_view[RENDER_COLOR_ATTACHMENTS_MAX]         = {};
 		uint64_t           depth_id                                         = 0;
+		VkImageView        depth_view                                       = nullptr;
 		bool               color_clear_enable[RENDER_COLOR_ATTACHMENTS_MAX] = {};
 		VkImageLayout      color_layout[RENDER_COLOR_ATTACHMENTS_MAX]       = {};
 		bool               depth_clear_enable                               = false;

@@ -6,6 +6,7 @@
 
 #include <span>
 #include <utility>
+#include <vector>
 #include <vulkan/vulkan_core.h>
 
 namespace Libs::Graphics {
@@ -19,33 +20,55 @@ struct DepthStencilVulkanImage;
 struct VulkanSwapchain;
 
 struct BufferImageCopy {
-	uint32_t offset;
-	uint32_t pitch;
-	uint32_t dst_level;
-	uint32_t width;
-	uint32_t height;
-	uint32_t copy_height = 0;
-	uint32_t dst_layer   = 0;
-	int      dst_x;
-	int      dst_y;
-	int      dst_z = 0;
+	uint32_t           offset;
+	uint32_t           pitch;
+	uint32_t           dst_level;
+	uint32_t           width;
+	uint32_t           height;
+	uint32_t           copy_height = 0;
+	uint32_t           dst_layer   = 0;
+	int                dst_x;
+	int                dst_y;
+	int                dst_z  = 0;
+	VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+};
+
+struct ImageBufferCopy {
+	uint32_t           offset;
+	uint32_t           pitch;
+	uint32_t           src_level;
+	uint32_t           width;
+	uint32_t           height;
+	uint32_t           copy_height = 0;
+	uint32_t           src_layer   = 0;
+	int                src_x;
+	int                src_y;
+	int                src_z  = 0;
+	VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT;
 };
 
 struct ImageImageCopy {
-	VulkanImage* src_image;
-	uint32_t     src_level;
-	uint32_t     dst_level;
-	uint32_t     width;
-	uint32_t     height;
-	uint32_t     src_layer = 0;
-	uint32_t     dst_layer = 0;
-	int          src_x;
-	int          src_y;
-	int          src_z = 0;
-	int          dst_x;
-	int          dst_y;
-	int          dst_z = 0;
+	VulkanImage*       src_image;
+	uint32_t           src_level;
+	uint32_t           dst_level;
+	uint32_t           width;
+	uint32_t           height;
+	uint32_t           src_layer  = 0;
+	uint32_t           dst_layer  = 0;
+	VkImageAspectFlags src_aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+	VkImageAspectFlags dst_aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+	int                src_x;
+	int                src_y;
+	int                src_z = 0;
+	int                dst_x;
+	int                dst_y;
+	int                dst_z = 0;
 };
+
+[[nodiscard]] std::vector<ImageBufferCopy>
+MakeLayeredImageBufferCopies(uint32_t layers, uint64_t slice_size, uint32_t pitch, uint32_t width,
+                             uint32_t           height,
+                             VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT);
 
 enum class StagingBufferType { Texture, Vertex, ReadBack };
 
@@ -67,7 +90,9 @@ void UtilCopyImageWithBuffer(CommandBuffer* buffer, GraphicContext* ctx, VulkanI
                              VkImageAspectFlags src_aspect, VulkanImage* dst_image,
                              VkImageAspectFlags dst_aspect, uint32_t bytes_per_element,
                              uint64_t dst_layout);
-void UtilBlitImage(CommandBuffer* buffer, VulkanImage* src_image, VulkanSwapchain* dst_swapchain);
+void UtilBlitPreparedImage(CommandBuffer* buffer, VulkanImage* src_image,
+                           VulkanSwapchain* dst_swapchain);
+void UtilClearColorImage(CommandBuffer* buffer, VulkanImage* image, const VkClearColorValue& color);
 void UtilFillImage(GraphicContext* ctx, VulkanImage* dst_image, const void* src_data, uint64_t size,
                    uint32_t src_pitch, uint64_t dst_layout);
 void UtilFillImage(GraphicContext* ctx, DepthStencilVulkanImage* dst_image, const void* src_data,
@@ -79,8 +104,12 @@ void UtilFillImage(GraphicContext* ctx, std::span<const ImageImageCopy> regions,
 void UtilFillBuffer(GraphicContext* ctx, void* dst_data, uint64_t size, uint32_t dst_pitch,
                     VulkanImage* src_image, uint64_t src_layout,
                     VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT);
+void UtilFillBuffer(GraphicContext* ctx, void* dst_data, uint64_t size,
+                    std::span<const ImageBufferCopy> regions, VulkanImage* src_image,
+                    uint64_t src_layout);
 void UtilUploadBuffer(GraphicContext* ctx, StagingBufferType type, VulkanBuffer* dst_buffer,
                       uint64_t dst_offset, const void* src_data, uint64_t size);
+void UtilReleaseCachedResources(GraphicContext* ctx);
 void UtilCopyBuffer(VulkanBuffer* src_buffer, VulkanBuffer* dst_buffer, uint64_t size);
 void UtilDownloadBuffer(GraphicContext* ctx, VulkanBuffer* src_buffer, uint64_t src_offset,
                         void* dst_data, uint64_t size);
