@@ -253,6 +253,7 @@ bool DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	const uint32_t srsrc  = (word1 >> 16u) & 0x1fu;
 	const uint32_t ssamp  = (word1 >> 21u) & 0x1fu;
 	const bool     a16    = ((word1 >> 30u) & 0x1u) != 0u;
+	const uint32_t tfe    = (word0 >> 16u) & 1u;
 	const auto*    sample = LookupSample(opcode);
 	const auto*    gather = LookupGather(opcode);
 	const auto*    atomic = LookupAtomic(opcode);
@@ -303,6 +304,16 @@ bool DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	if (gather != nullptr && !IsSingleDmaskBit(inst->dmask)) {
 		SetUnsupported(inst, Family::MIMG, opcode,
 		               "MIMG image gather requires exactly one dmask bit");
+	}
+	if (tfe != 0 && inst->opcode != Opcode::Unsupported) {
+		// TFE (word0 bit 16) adds a residency-code return VGPR, so ignoring it gets the register
+		// allocation wrong -- same class as the MUBUF/MTBUF TFE handling in MemoryOps.cpp. The other
+		// ignored MIMG modifier bits are left alone on purpose: R128 (descriptor size) is already
+		// captured by the traced descriptor dword_count, UNRM has no effect on load/store and is
+		// routinely set on stores so rejecting it would regress real shaders, and DLC/LWE cannot
+		// change the data. D16 is a genuine gap but needs a GPU to validate a fix against, so it
+		// stays decoded-and-ignored for now rather than risking a blind regression.
+		SetUnsupported(inst, Family::MIMG, opcode, "MIMG TFE modifier is not implemented");
 	}
 
 	DecodeVectorGpr(vdata, &inst->dst, nullptr);
