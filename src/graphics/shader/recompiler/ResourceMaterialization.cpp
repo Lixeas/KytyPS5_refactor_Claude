@@ -28,6 +28,10 @@ bool NullImageDescriptor(const DescriptorValue& descriptor) {
 	return descriptor.dwords[0] == 0 && (descriptor.dwords[1] & 0xffu) == 0;
 }
 
+bool ValidImageDescriptor(const DescriptorValue& descriptor) {
+	return ((descriptor.dwords[3] >> 28u) & 0x8u) != 0;
+}
+
 uint32_t DescriptorImageSwizzle(const DescriptorValue& descriptor) {
 	return descriptor.dwords[3] & 0xfffu;
 }
@@ -85,6 +89,15 @@ bool ValidateResourceSnapshot(const Program& program, const ResourceSnapshot& sn
 				}
 				return false;
 			}
+		}
+	}
+	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+		const auto alias = program.info.buffers[i].image_alias;
+		if (alias != BufferResource::NoImageAlias && alias >= program.info.images.size()) {
+			if (error != nullptr) {
+				*error = fmt::format("buffer resource {} has invalid image alias {}", i, alias);
+			}
+			return false;
 		}
 	}
 	const auto CheckWidth = [&](const auto& values, uint32_t width, const char* kind) {
@@ -223,6 +236,11 @@ bool MaterializeResources(const Program& program, const SrtRuntime& runtime,
 	cursor += program.info.buffers.size();
 	next.images.assign(cursor, cursor + program.info.images.size());
 	cursor += program.info.images.size();
+	for (auto& descriptor: next.images) {
+		if (!ValidImageDescriptor(descriptor)) {
+			descriptor.dwords.fill(0);
+		}
+	}
 	next.samplers.assign(cursor, cursor + program.info.samplers.size());
 	cursor += program.info.samplers.size();
 	for (const auto& address: program.info.addresses) {
