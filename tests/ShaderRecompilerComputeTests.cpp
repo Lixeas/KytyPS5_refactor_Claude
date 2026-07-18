@@ -4101,6 +4101,34 @@ TestCase VectorVop3MoveAppliesFloatSourceModifiers() {
   return test;
 }
 
+// The VOP3 source modifiers (neg/abs) and the omod output multiplier are exercised elsewhere
+// (VectorVop3MoveAppliesFloatSourceModifiers, VectorFloatArithmeticOps), but the CLMP result
+// modifier had no coverage. CLMP saturates the float result to [0,1] after omod. This checks both
+// ends: 3.0 clamps down to 1.0 and -3.0 clamps up to 0.0. Without the clamp the results would be
+// 3.0 and -3.0, so the case only passes if it is actually emitted.
+TestCase Vop3AppliesResultClamp() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendSMovLiteral(&code, 24, 0x40400000u);  // 3.0
+  AppendSMovLiteral(&code, 25, 0x00000000u);  // 0.0
+  AppendSMovLiteral(&code, 26, 0xc0400000u);  // -3.0
+  // V_ADD_F32 (VOP3 0x103) with CLMP: clamp(3.0 + 0.0) = 1.0.
+  AppendVop3(&code, 0x103, 1, 24, 25, 0, 0, 0, true, 0, 0);
+  AppendStoreVgpr(&code, 1, 0);
+  // V_ADD_F32 with CLMP: clamp(-3.0 + 0.0) = 0.0.
+  AppendVop3(&code, 0x103, 2, 26, 25, 0, 0, 0, true, 0, 0);
+  AppendStoreVgpr(&code, 2, 1);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "Vop3AppliesResultClamp";
+  test.code = code;
+  test.expected = {0x3f800000u, 0x00000000u};
+  test.opcodes = {O::SMovB32, O::VAddF32, O::BufferStoreDword, O::SEndpgm};
+  return test;
+}
+
 TestCase VectorIntegerOps() {
   using O = ShaderOpcode;
 
@@ -8817,6 +8845,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ScalarLiteral);
   AddCase(VectorMoves);
   AddCase(VectorVop3MoveAppliesFloatSourceModifiers);
+  AddCase(Vop3AppliesResultClamp);
   AddCase(VectorIntegerOps);
   AddCase(VectorShiftCountsMaskLowBits);
   AddCase(VectorVop3IntegerOps);
