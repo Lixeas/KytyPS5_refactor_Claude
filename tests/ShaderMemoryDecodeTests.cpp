@@ -1,3 +1,4 @@
+#include "graphics/shader/recompiler/ImageOps.h"
 #include "graphics/shader/recompiler/MemoryOps.h"
 #include "graphics/shader/recompiler/ShaderDecoder.h"
 
@@ -115,6 +116,40 @@ void TestMtbufTfeIsRejected() {
 	Check(tfe.opcode == Opcode::Unsupported, "MTBUF with TFE=1 decoded as a plain load");
 }
 
+// MIMG word0: OP [0],[24:18], NSA [2:1], DIM [5:3], DLC [7], DMASK [11:8], UNRM [12], GLC [13],
+//             R128 [15], TFE [16], LWE [17], SLC [25], ENCODING [31:26] = 111100.
+// MIMG word1: VADDR [7:0], VDATA [15:8], SRSRC [20:16], SSAMP [25:21], A16 [30], D16 [31].
+constexpr uint32_t MimgWord0(uint32_t opcode, uint32_t dmask, bool tfe = false, uint32_t dim = 1u) {
+	return (0x3cu << 26u) | ((opcode & 0x7fu) << 18u) | ((opcode >> 7u) & 1u) | ((dim & 0x7u) << 3u) |
+	       ((dmask & 0xfu) << 8u) | (tfe ? (1u << 16u) : 0u);
+}
+
+constexpr uint32_t MimgWord1(uint32_t vaddr = 4u, uint32_t vdata = 0u) {
+	return (vaddr & 0xffu) | ((vdata & 0xffu) << 8u);
+}
+
+Instruction DecodeMimgOne(uint32_t word0, uint32_t word1) {
+	const std::array<uint32_t, 2> code {word0, word1};
+	Instruction                   inst;
+	std::string                   error;
+	Check(DecodeMimg(0, code, 0, &inst, &error), "DecodeMimg reported a hard failure");
+	return inst;
+}
+
+// Regression test. TFE (word0 bit 16) adds a residency-code return VGPR; the recompiler does not
+// model it, so a shader setting it used to decode as a plain image op with the wrong register
+// count. IMAGE_LOAD (opcode 0) is implemented, so it is the baseline that must still decode, and the
+// same op with TFE=1 must now be rejected. Only TFE is checked here: the other ignored modifier
+// bits (R128/UNRM/D16/LWE/DLC) are deliberately left decoded-and-ignored, see DecodeMimg.
+void TestMimgTfeIsRejected() {
+	const auto plain = DecodeMimgOne(MimgWord0(0x00u, 0xfu), MimgWord1());
+	Check(plain.family == Family::MIMG, "family is not MIMG");
+	Check(plain.opcode == Opcode::ImageLoad, "IMAGE_LOAD baseline did not decode");
+
+	const auto tfe = DecodeMimgOne(MimgWord0(0x00u, 0xfu, true), MimgWord1());
+	Check(tfe.opcode == Opcode::Unsupported, "MIMG with TFE=1 decoded as a plain image load");
+}
+
 } // namespace
 
 int main() {
@@ -123,6 +158,7 @@ int main() {
 	TestMubufLdsAndTfeAreRejected();
 	TestMtbufOpcodeSplitAcrossWords();
 	TestMtbufTfeIsRejected();
+	TestMimgTfeIsRejected();
 
 	std::puts("ShaderMemoryDecodeTests: all cases passed");
 	return 0;
